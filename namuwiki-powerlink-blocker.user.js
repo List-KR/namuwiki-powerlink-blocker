@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         NamuWiki PowerLink Blocker
 // @namespace    List-KR
-// @version      2.6.0
-// @description  Safely block NamuWiki PowerLink and mobile-UA reserved ad slots
+// @version      2.7.0
+// @description  Block NamuWiki PowerLink and mobile reserved ad slots
 // @match        https://namu.wiki/*
 // @updateURL    https://raw.githubusercontent.com/List-KR/namuwiki-powerlink-blocker/refs/heads/main/namuwiki-powerlink-blocker.user.js
 // @downloadURL  https://raw.githubusercontent.com/List-KR/namuwiki-powerlink-blocker/refs/heads/main/namuwiki-powerlink-blocker.user.js
@@ -13,787 +13,408 @@
 (() => {
     'use strict';
 
-    /*
-     * ============================================================
-     * 0. Configuration
-     * ============================================================
-     */
+    const MOBILE =
+        navigator.userAgentData?.mobile === true ||
+        /Android|Mobile|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
-    const DEBUG = false;
+    const ATTR = 'data-nwp';
+    const TIMEOUT = 8000;
 
-    const STYLE_ID =
-        'namuwiki-powerlink-blocker-style';
-
-    const ATTR_POWERLINK =
-        'data-nwp-powerlink';
-
-    const ATTR_POWERLINK_SHELL =
-        'data-nwp-powerlink-shell';
-
-    const ATTR_MOBILE_SLOT =
-        'data-nwp-mobile-reserved-slot';
-
-
-    function debug(...args) {
-        if (DEBUG) {
-            console.debug(
-                '[PowerLink]',
-                ...args
-            );
-        }
-    }
+    const timers = new Map();
+    let rejected = new WeakSet();
+    let scheduled = false;
+    let lastURL = location.href;
 
 
     /*
      * ============================================================
-     * 1. Mobile UA
-     * ============================================================
-     *
-     * viewport가 아니라 UA를 본다.
-     *
-     * 확인된 차이:
-     *
-     * PC UA + 좁은 viewport
-     *   → 별도 모바일 예약 슬롯 문제 없음
-     *
-     * Mobile UA
-     *   → Android / iOS에서 예약 광고 슬롯 발생
-     */
-
-    function detectMobileUA() {
-        try {
-            if (
-                navigator.userAgentData?.mobile === true
-            ) {
-                return true;
-            }
-        } catch {
-            // ignored
-        }
-
-        const ua =
-            String(
-                navigator.userAgent || ''
-            );
-
-        return (
-            /Android|Mobile|iPhone|iPad|iPod/i
-                .test(ua)
-        );
-    }
-
-
-    const MOBILE_UA =
-        detectMobileUA();
-
-
-    /*
-     * ============================================================
-     * 2. DOM helpers
-     * ============================================================
-     */
-
-    function isElement(node) {
-        return (
-            !!node &&
-            node.nodeType === 1
-        );
-    }
-
-
-    function isTag(node, tag) {
-        return (
-            isElement(node) &&
-            node.localName === tag
-        );
-    }
-
-
-    function isDiv(node) {
-        return isTag(node, 'div');
-    }
-
-
-    function cleanText(text) {
-        return String(text || '')
-            .replace(/\u00a0/g, '')
-            .replace(/\s+/g, ' ')
-            .trim();
-    }
-
-
-    function cssNumber(value) {
-        const n =
-            Number.parseFloat(value);
-
-        return Number.isFinite(n)
-            ? n
-            : 0;
-    }
-
-
-    /*
-     * 클래스명을 하드코딩하지 않는다.
-     *
-     * 단, 같은 페이지에서 같은 종류의 component가
-     * 반복되는지 확인하는 runtime signature로는 사용한다.
-     */
-    function classSignature(el) {
-        if (!isElement(el))
-            return null;
-
-        const value =
-            el.getAttribute('class');
-
-        if (!value)
-            return null;
-
-        const result =
-            value
-                .trim()
-                .replace(/\s+/g, ' ');
-
-        return result || null;
-    }
-
-
-    /*
-     * ============================================================
-     * 3. CSS
+     * CSS
      * ============================================================
      */
 
     function installCSS() {
-        if (!document.documentElement)
+        if (!document.documentElement ||
+            document.getElementById('nwp-style'))
             return;
 
-        if (
-            document.getElementById(
-                STYLE_ID
-            )
-        ) {
-            return;
-        }
+        const style = document.createElement('style');
 
-        const style =
-            document.createElement(
-                'style'
-            );
-
-        style.id =
-            STYLE_ID;
-
+        style.id = 'nwp-style';
         style.textContent = `
             /*
-             * 실제 Android/iOS에서 차단 확인된
-             * PowerLink 본체.
-             *
-             * PC / Mobile 공통.
+             * 실제 확인된 PowerLink.
              */
             div[style*="width:auto"]:has(
-                > table
-                a[href^="#s-"]
-                img[data-doc][data-filesize]
+                > table a[href^="#s-"] img[data-doc][data-filesize]
             ),
-
             div[style*="width: auto"]:has(
-                > table
-                a[href^="#s-"]
-                img[data-doc][data-filesize]
+                > table a[href^="#s-"] img[data-doc][data-filesize]
             ),
 
             /*
-             * JS에서 확정한 요소들.
+             * JS가 임시/확정 차단한 슬롯.
              */
-            [${ATTR_POWERLINK}="1"],
-            [${ATTR_POWERLINK_SHELL}="1"],
-            [${ATTR_MOBILE_SLOT}="1"] {
+            [${ATTR}] {
                 display: none !important;
             }
         `;
 
-        document.documentElement
-            .appendChild(style);
-
-        debug(
-            'CSS installed',
-            {
-                mobileUA: MOBILE_UA
-            }
-        );
+        document.documentElement.appendChild(style);
     }
 
 
     /*
      * ============================================================
-     * 4. Exact PowerLink
+     * Helpers
      * ============================================================
-     *
-     * PowerLink 확정 조건:
-     *
-     * <div style="width:auto">
-     *   <table>
-     *     ...
-     *     <a href="#s-*">
-     *       <img data-doc data-filesize>
-     *     </a>
-     *   </table>
-     * </div>
-     *
-     * /jump/ 단독 조건은 사용하지 않는다.
-     * 일반 문서 이미지에도 존재하기 때문.
      */
 
-    function getDirectTable(root) {
-        if (!isElement(root))
-            return null;
+    const div = el =>
+        el?.nodeType === 1 &&
+        el.localName === 'div';
 
-        for (
-            const child of
-            root.children
-        ) {
-            if (
-                child.localName ===
-                'table'
-            ) {
-                return child;
-            }
-        }
+    const text = el =>
+        String(el?.textContent || '')
+            .replace(/\u00a0/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
 
-        return null;
-    }
+    const cls = el =>
+        el?.getAttribute?.('class')
+            ?.trim()
+            .replace(/\s+/g, ' ') || '';
+
+    const domainRE =
+        /(?:https?:\/\/|www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:\/[^\s]*)?/i;
 
 
-    function isExactPowerLinkRoot(root) {
-        if (!isDiv(root))
+    /*
+     * ============================================================
+     * Exact PowerLink
+     * ============================================================
+     */
+
+    function isPowerLink(el) {
+        if (!div(el) || el.style.width !== 'auto')
             return false;
-
-        if (
-            !root.style ||
-            root.style.width !== 'auto'
-        ) {
-            return false;
-        }
 
         const table =
-            getDirectTable(root);
+            [...el.children]
+                .find(x => x.localName === 'table');
 
-        if (!table)
-            return false;
-
-        return !!table.querySelector(
-            'a[href^="#s-"] ' +
-            'img[data-doc][data-filesize]'
+        return !!table?.querySelector(
+            'a[href^="#s-"] img[data-doc][data-filesize]'
         );
     }
 
 
-    function markPowerLink(root) {
-        if (
-            !isExactPowerLinkRoot(root)
-        ) {
-            return false;
-        }
+    function containsPowerLink(el) {
+        if (isPowerLink(el))
+            return true;
 
-        if (
-            root.getAttribute(
-                ATTR_POWERLINK
-            ) !== '1'
-        ) {
-            root.setAttribute(
-                ATTR_POWERLINK,
-                '1'
-            );
-
-            debug(
-                'PowerLink confirmed',
-                root
-            );
-        }
-
-        return true;
+        return [...el.querySelectorAll?.('div[style]') || []]
+            .some(isPowerLink);
     }
 
 
     /*
      * ============================================================
-     * 5. Mobile PowerLink shell
+     * Slot state
      * ============================================================
-     *
-     * Android에서 실측:
-     *
-     * PowerLink
-     *   ↓
-     * 높이 0 wrapper
-     *   ↓
-     * 약 208px reserved shell
-     *
-     * PowerLink 본체만 숨기면 이 shell 때문에
-     * 투명 공간이 남았다.
      */
 
-    function getSafePowerLinkShell(root) {
-        if (!MOBILE_UA)
-            return null;
+    function clearTimer(el) {
+        const id = timers.get(el);
 
+        if (id !== undefined) {
+            clearTimeout(id);
+            timers.delete(el);
+        }
+    }
+
+
+    function confirm(el) {
+        if (!el)
+            return;
+
+        clearTimer(el);
+        el.setAttribute(ATTR, 'confirmed');
+    }
+
+
+    function provisional(el) {
         if (
-            !isExactPowerLinkRoot(root)
+            !el ||
+            el.hasAttribute(ATTR) ||
+            rejected.has(el)
         ) {
-            return null;
+            return;
         }
 
-        const inner =
-            root.parentElement;
+        el.setAttribute(ATTR, 'temp');
 
-        const shell =
-            inner?.parentElement;
+        const id = setTimeout(() => {
+            timers.delete(el);
 
-        if (
-            !isDiv(inner) ||
-            !isDiv(shell)
-        ) {
-            return null;
+            if (!el.isConnected)
+                return;
+
+            /*
+             * PowerLink가 결국 들어왔으면 유지.
+             */
+            if (containsPowerLink(el)) {
+                el.setAttribute(ATTR, 'confirmed');
+                return;
+            }
+
+            /*
+             * 아니면 복원하고 같은 route에서는 다시 안 건드림.
+             */
+            el.removeAttribute(ATTR);
+            rejected.add(el);
+
+        }, TIMEOUT);
+
+        timers.set(el, id);
+    }
+
+
+    /*
+     * ============================================================
+     * PowerLink 등장 시 provisional slot 승격
+     * ============================================================
+     */
+
+    function handlePowerLink(root) {
+        /*
+         * 먼저 이미 임시 차단해 둔 상위 광고 slot을 찾는다.
+         */
+        let el = root;
+
+        for (let i = 0; el && i < 10; i++, el = el.parentElement) {
+            if (el.getAttribute?.(ATTR) === 'temp') {
+                confirm(el);
+                return;
+            }
         }
+
+
+        if (!MOBILE)
+            return;
 
 
         /*
-         * 페이지 전체를 절대 잡지 않는다.
+         * Android에서 확인된:
+         *
+         * PowerLink
+         *   -> 0px wrapper
+         *   -> 약 208px reserved shell
          */
+        const inner = root.parentElement;
+        const shell = inner?.parentElement;
+
+        if (!div(inner) || !div(shell))
+            return;
+
         if (
             shell === document.body ||
             shell === document.documentElement ||
             shell.id === 'app'
         ) {
-            return null;
+            return;
         }
 
+        const sr = shell.getBoundingClientRect();
+        const ir = inner.getBoundingClientRect();
 
         if (
-            root.parentElement !== inner ||
-            inner.parentElement !== shell
-        ) {
-            return null;
-        }
-
-
-        const shellRect =
-            shell.getBoundingClientRect();
-
-        const innerRect =
-            inner.getBoundingClientRect();
-
-        const style =
-            getComputedStyle(shell);
-
-
-        /*
-         * 실제값은 208px.
-         *
-         * 약간의 변화만 허용한다.
-         */
-        if (
-            shellRect.height < 140 ||
-            shellRect.height > 340
-        ) {
-            return null;
-        }
-
-
-        if (
-            shellRect.width <
-            window.innerWidth * 0.65
-        ) {
-            return null;
-        }
-
-
-        if (
+            sr.height < 140 ||
+            sr.height > 340 ||
+            sr.width < innerWidth * .65 ||
+            ir.height > 12 ||
             shell.children.length > 10
         ) {
-            return null;
+            return;
         }
 
-
         /*
-         * PowerLink를 직접 감싸는 wrapper는
-         * 거의 0px이어야 한다.
+         * PowerLink 경로 외의 자식이 실질적 공간을 쓰면
+         * shell 전체는 건드리지 않는다.
          */
-        if (
-            innerRect.height > 12
-        ) {
-            return null;
-        }
-
-
-        /*
-         * 다른 자식이 실제 콘텐츠를 차지하고 있다면
-         * shell 전체를 건드리지 않는다.
-         */
-        for (
-            const child of
-            shell.children
-        ) {
-            if (child === inner)
-                continue;
-
-            const rect =
-                child.getBoundingClientRect();
-
+        for (const child of shell.children) {
             if (
-                rect.height > 12
+                child !== inner &&
+                child.getBoundingClientRect().height > 12
             ) {
-                return null;
+                return;
             }
         }
 
-
-        const minHeight =
-            cssNumber(
-                style.minHeight
-            );
-
-
-        if (
-            minHeight < 100 &&
-            shellRect.height < 160
-        ) {
-            return null;
-        }
-
-        return shell;
-    }
-
-
-    function markPowerLinkShell(root) {
-        if (!MOBILE_UA)
-            return;
-
-        const shell =
-            getSafePowerLinkShell(root);
-
-        if (!shell)
-            return;
-
-        /*
-         * Sticky.
-         *
-         * 같은 URL에서는 절대 복원하지 않는다.
-         */
-        if (
-            shell.getAttribute(
-                ATTR_POWERLINK_SHELL
-            ) !== '1'
-        ) {
-            shell.setAttribute(
-                ATTR_POWERLINK_SHELL,
-                '1'
-            );
-
-            debug(
-                'PowerLink shell confirmed',
-                shell
-            );
-        }
+        confirm(shell);
     }
 
 
     /*
      * ============================================================
-     * 6. Mobile reserved-slot geometry
+     * Mobile reserved-slot detection
      * ============================================================
-     *
-     * 확인된 사례:
-     *
-     * Android:
-     *   약 360 × 250
-     *
-     * iOS:
-     *   약 200px대 높이의 full-width 검은 placeholder
-     *
-     * 특정 250px 하나에 고정하지 않는다.
      */
 
-    function isMobileReservedGeometry(
-        slot,
-        parentRect
-    ) {
-        if (!isDiv(slot))
+    function mobileGeometry(el) {
+        if (!MOBILE || !div(el))
             return false;
 
-        const rect =
-            slot.getBoundingClientRect();
+        const parent = el.parentElement;
 
+        if (!parent)
+            return false;
+
+        const r = el.getBoundingClientRect();
+        const p = parent.getBoundingClientRect();
 
         if (
-            rect.width <= 0 ||
-            rect.height <= 0
+            r.width <= 0 ||
+            r.height <= 0 ||
+            p.width <= 0
         ) {
             return false;
         }
 
+        const ratio = r.height / r.width;
 
-        /*
-         * 부모 폭 거의 전체.
-         */
-        if (
-            rect.width <
-            parentRect.width * 0.92
-        ) {
-            return false;
-        }
-
-
-        /*
-         * 모바일 viewport에서도
-         * 충분히 넓은 요소여야 한다.
-         */
-        if (
-            rect.width <
-            window.innerWidth * 0.70
-        ) {
-            return false;
-        }
-
-
-        /*
-         * Android 250px +
-         * iOS의 200px대 reserved slot.
-         *
-         * 너무 넓히면 정상 콘텐츠 위험이 커지므로
-         * 현재 확인 범위만 사용한다.
-         */
-        if (
-            rect.height < 170 ||
-            rect.height > 280
-        ) {
-            return false;
-        }
-
-        return true;
-    }
-
-
-    /*
-     * ============================================================
-     * 7. Normal document-content protection
-     * ============================================================
-     *
-     * div / span / svg 같은 광고 placeholder 내부 구조는 허용.
-     *
-     * 명확한 문서/미디어 콘텐츠가 존재하면
-     * 단독 빈 슬롯 탐지에서 제외한다.
-     */
-
-    const FORBIDDEN_EMPTY_SLOT_SELECTOR = [
-        'article',
-        'main',
-
-        'h1',
-        'h2',
-        'h3',
-        'h4',
-        'h5',
-        'h6',
-
-        'p',
-        'blockquote',
-        'ul',
-        'ol',
-        'pre',
-
-        'table',
-
-        'figure',
-        'picture',
-        'img',
-
-        'iframe',
-        'video',
-        'audio',
-        'canvas',
-
-        'form',
-        'input',
-        'textarea',
-        'select',
-        'button'
-    ].join(',');
-
-
-    function containsForbiddenEmptySlotContent(
-        slot
-    ) {
-        if (!isElement(slot))
-            return true;
-
-        return !!slot.querySelector(
-            FORBIDDEN_EMPTY_SLOT_SELECTOR
+        return (
+            r.width >= p.width * .90 &&
+            r.width >= innerWidth * .68 &&
+            r.height >= 165 &&
+            r.height <= 300 &&
+            ratio >= .47 &&
+            ratio <= .78
         );
     }
 
 
     /*
-     * ============================================================
-     * 8. Loaded-ad hints
-     * ============================================================
+     * 정상 나무위키 본문으로 보이면 후보에서 제외.
+     *
+     * 광고를 놓치는 쪽을 선호한다.
      */
+    function adLike(el) {
+        if (containsPowerLink(el))
+            return true;
 
-    const DOMAIN_LIKE_RE =
-        /(?:https?:\/\/|www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:\/[^\s]*)?/i;
-
-
-    function containsExactPowerLink(root) {
-        if (!isElement(root))
-            return false;
-
-        for (
-            const div of
-            root.querySelectorAll(
-                'div[style]'
+        if (
+            el.querySelector(
+                'article,main,h1,h2,h3,h4,h5,h6,' +
+                'p,blockquote,ul,ol,pre,table,' +
+                'form,input,textarea,select'
             )
         ) {
-            if (
-                isExactPowerLinkRoot(div)
-            ) {
-                return true;
-            }
+            return false;
         }
 
-        return false;
+        /*
+         * 일반 나무위키 이미지/임베드 보호.
+         */
+        if (
+            el.querySelector(
+                'figure,picture,video,audio,canvas,' +
+                'img[data-doc],img[data-filesize]'
+            )
+        ) {
+            return false;
+        }
+
+        const t = text(el);
+
+        return (
+            t === '' ||
+            (
+                t.length <= 700 &&
+                domainRE.test(t)
+            )
+        );
     }
 
 
     /*
-     * ============================================================
-     * 9. Long article-sequence parent
-     * ============================================================
-     *
-     * 본문 중간 광고를 찾을 때만 사용한다.
-     *
-     * 상단 광고는 별도 scanner가 담당한다.
+     * 검은 surface를 감싸는 같은 크기의 wrapper까지 승격.
      */
+    function slotShell(el) {
+        let current = el;
 
-    function isArticleSequenceParent(
-        parent
-    ) {
-        if (!isDiv(parent))
-            return false;
+        for (let i = 0; i < 4; i++) {
+            const parent = current.parentElement;
 
-
-        if (
-            parent.children.length < 10
-        ) {
-            return false;
-        }
-
-
-        const rect =
-            parent.getBoundingClientRect();
-
-
-        if (
-            rect.height <
-            window.innerHeight * 3
-        ) {
-            return false;
-        }
-
-
-        if (
-            rect.width <
-            window.innerWidth * 0.70
-        ) {
-            return false;
-        }
-
-        return true;
-    }
-
-
-    /*
-     * ============================================================
-     * 10. Document neighbor
-     * ============================================================
-     *
-     * 단독 검은 박스가 실제 본문 사이에 끼어 있는지 확인.
-     */
-
-    function looksLikeDocumentNeighbor(
-        el
-    ) {
-        if (!isElement(el))
-            return false;
-
-
-        /*
-         * 이미 우리가 잡은 광고는 건너뛴다.
-         */
-        if (
-            el.getAttribute(
-                ATTR_MOBILE_SLOT
-            ) === '1'
-        ) {
-            return false;
-        }
-
-
-        const text =
-            cleanText(
-                el.textContent
-            );
-
-
-        if (
-            text.length >= 4
-        ) {
-            return true;
-        }
-
-
-        if (
-            el.querySelector?.(
-                'h1,h2,h3,h4,h5,h6,p,blockquote'
-            )
-        ) {
-            return true;
-        }
-
-        return false;
-    }
-
-
-    function findMeaningfulSibling(
-        start,
-        direction
-    ) {
-        let current =
-            start;
-
-
-        /*
-         * 중간에 0px spacer 등이 낄 수 있으므로
-         * 최대 5개까지 건너뛴다.
-         */
-        for (
-            let i = 0;
-            current && i < 5;
-            i++
-        ) {
             if (
-                looksLikeDocumentNeighbor(
-                    current
-                )
+                !div(parent) ||
+                parent === document.body ||
+                parent === document.documentElement ||
+                parent.id === 'app'
             ) {
-                return current;
+                break;
             }
 
+            const a = current.getBoundingClientRect();
+            const b = parent.getBoundingClientRect();
 
-            current =
-                direction < 0
-                    ? current.previousElementSibling
-                    : current.nextElementSibling;
+            if (
+                Math.abs(a.width - b.width) > 20 ||
+                Math.abs(a.height - b.height) > 32
+            ) {
+                break;
+            }
+
+            let occupied = false;
+
+            for (const child of parent.children) {
+                if (child === current)
+                    continue;
+
+                const r = child.getBoundingClientRect();
+
+                if (
+                    (r.width > 20 && r.height > 20) ||
+                    text(child)
+                ) {
+                    occupied = true;
+                    break;
+                }
+            }
+
+            if (occupied)
+                break;
+
+            current = parent;
         }
 
+        return current;
+    }
+
+
+    function meaningful(el) {
+        return !!el && (
+            text(el).length >= 4 ||
+            !!el.querySelector?.(
+                'h1,h2,h3,h4,h5,h6,p,blockquote,ul,ol,table'
+            )
+        );
+    }
+
+
+    function neighbor(el, dir) {
+        for (let i = 0; el && i < 8; i++) {
+            if (
+                !el.hasAttribute?.(ATTR) &&
+                meaningful(el)
+            ) {
+                return el;
+            }
+
+            el =
+                dir < 0
+                    ? el.previousElementSibling
+                    : el.nextElementSibling;
+        }
 
         return null;
     }
@@ -801,908 +422,233 @@
 
     /*
      * ============================================================
-     * 11. Standalone empty mobile slot
+     * Mobile scan
      * ============================================================
-     *
-     * 이번 iOS 사례의 핵심.
-     *
-     * 긴 본문 container가 아니어도:
-     *
-     * 분류 / 제목 / 설명
-     * ↓
-     * [검은 full-width 예약 광고]
-     * ↓
-     * 실제 본문
-     *
-     * 형태를 잡는다.
      */
 
-    function looksSafeAsStandaloneEmptySlot(
-        slot
-    ) {
-        if (!MOBILE_UA)
-            return false;
+    function scanMobileSlots() {
+        if (!MOBILE)
+            return;
+
+        const candidates = [];
+        const seen = new Set();
 
 
-        if (!isDiv(slot))
-            return false;
+        for (const surface of document.querySelectorAll('div')) {
+            if (
+                surface.closest(`[${ATTR}]`) ||
+                !mobileGeometry(surface) ||
+                !adLike(surface)
+            ) {
+                continue;
+            }
 
+            const shell = slotShell(surface);
 
-        if (
-            slot.getAttribute(
-                ATTR_MOBILE_SLOT
-            ) === '1'
-        ) {
-            return false;
-        }
+            if (seen.has(shell))
+                continue;
 
+            seen.add(shell);
 
-        const parent =
-            slot.parentElement;
-
-
-        if (
-            !isDiv(parent) &&
-            !isElement(parent)
-        ) {
-            return false;
-        }
-
-
-        /*
-         * html/body/#app는 후보 parent로 인정하지 않는다.
-         */
-        if (
-            parent === document.body ||
-            parent === document.documentElement ||
-            parent.id === 'app'
-        ) {
-            return false;
-        }
-
-
-        const parentRect =
-            parent.getBoundingClientRect();
-
-
-        if (
-            !isMobileReservedGeometry(
-                slot,
-                parentRect
-            )
-        ) {
-            return false;
+            candidates.push({
+                shell,
+                parent: shell.parentElement,
+                signature: cls(shell)
+            });
         }
 
 
         /*
-         * 상단 검은 placeholder는 의미 있는 텍스트가 없어야 한다.
+         * 같은 parent + 같은 class의 후보가 반복되면
+         * Android에서 확인된 강한 광고 패턴.
          *
-         * NBSP / 공백은 cleanText에서 제거됨.
+         * 바로 sticky 확정.
          */
-        if (
-            cleanText(
-                slot.textContent
-            ) !== ''
-        ) {
-            return false;
+        const groups = new Map();
+
+        for (const c of candidates) {
+            if (!c.parent || !c.signature)
+                continue;
+
+            let byClass = groups.get(c.parent);
+
+            if (!byClass)
+                groups.set(c.parent, byClass = new Map());
+
+            let group = byClass.get(c.signature);
+
+            if (!group)
+                byClass.set(c.signature, group = []);
+
+            group.push(c);
+        }
+
+
+        const confirmed = new Set();
+
+        for (const byClass of groups.values()) {
+            for (const group of byClass.values()) {
+                if (group.length < 2)
+                    continue;
+
+                for (const { shell } of group) {
+                    confirm(shell);
+                    confirmed.add(shell);
+                }
+            }
         }
 
 
         /*
-         * div/span/svg 같은 placeholder wrapper는 허용하지만
-         * 실제 문서/미디어 구조가 있으면 보호한다.
-         */
-        if (
-            containsForbiddenEmptySlotContent(
-                slot
-            )
-        ) {
-            return false;
-        }
-
-
-        const previous =
-            findMeaningfulSibling(
-                slot.previousElementSibling,
-                -1
-            );
-
-        const next =
-            findMeaningfulSibling(
-                slot.nextElementSibling,
-                1
-            );
-
-
-        /*
-         * 정상 문서 내용 사이에 실제로 끼어 있을 때만.
+         * 단독 검은 박스는 일단 임시 차단.
          *
-         * 이 조건 때문에 화면의 아무 200px 빈 div나
-         * 무작정 지우지 않는다.
+         * 실제 PowerLink가 들어오면 confirmed.
+         * 8초 동안 안 들어오면 복원.
          */
-        if (
-            !previous ||
-            !next
-        ) {
-            return false;
-        }
-
-
-        return true;
-    }
-
-
-    /*
-     * ============================================================
-     * 12. Repeated mobile slot
-     * ============================================================
-     *
-     * Android에서 확인한 본문 중간 반복 광고.
-     *
-     * 동일 class 문자열을 하드코딩하지 않고
-     * 현재 route에서 같은 signature가 반복되는지만 본다.
-     */
-
-    function looksSafeAsRepeatedSlot(
-        slot
-    ) {
-        if (!isDiv(slot))
-            return false;
-
-
-        if (
-            containsExactPowerLink(
-                slot
-            )
-        ) {
-            return true;
-        }
-
-
-        const text =
-            cleanText(
-                slot.textContent
-            );
-
-
-        /*
-         * 로딩 중 빈 placeholder.
-         *
-         * 반복되는 동일 class + 동일 geometry라는
-         * 강한 추가 조건이 있기 때문에 허용.
-         */
-        if (text === '') {
-            return true;
-        }
-
-
-        /*
-         * 실제 광고가 로드된 상태.
-         */
-        if (
-            text.length <= 700 &&
-            DOMAIN_LIKE_RE.test(text)
-        ) {
-            return true;
-        }
-
-
-        return false;
-    }
-
-
-    function scanRepeatedMobileSlots(
-        parent,
-        parentRect
-    ) {
-        const groups =
-            new Map();
-
-
-        for (
-            const child of
-            parent.children
-        ) {
-            if (!isDiv(child))
-                continue;
-
-
-            const signature =
-                classSignature(child);
-
-
-            if (!signature)
-                continue;
-
-
-            let group =
-                groups.get(signature);
-
-
-            if (!group) {
-                group = [];
-
-                groups.set(
-                    signature,
-                    group
-                );
-            }
-
-
-            group.push(child);
-        }
-
-
-        for (
-            const [
-                signature,
-                group
-            ] of groups
-        ) {
+        for (const { shell } of candidates) {
             if (
-                group.length < 2
+                confirmed.has(shell) ||
+                shell.hasAttribute(ATTR)
             ) {
                 continue;
             }
-
-
-            let valid =
-                true;
-
-            let hasNew =
-                false;
-
-
-            for (
-                const slot of
-                group
-            ) {
-                /*
-                 * Sticky 슬롯은 재검증하지 않는다.
-                 */
-                if (
-                    slot.getAttribute(
-                        ATTR_MOBILE_SLOT
-                    ) === '1'
-                ) {
-                    continue;
-                }
-
-
-                hasNew =
-                    true;
-
-
-                if (
-                    !isMobileReservedGeometry(
-                        slot,
-                        parentRect
-                    )
-                ) {
-                    valid = false;
-                    break;
-                }
-
-
-                if (
-                    !looksSafeAsRepeatedSlot(
-                        slot
-                    )
-                ) {
-                    valid = false;
-                    break;
-                }
-            }
-
 
             if (
-                !valid ||
-                !hasNew
-            ) {
-                continue;
-            }
-
-
-            for (
-                const slot of
-                group
-            ) {
-                if (
-                    slot.getAttribute(
-                        ATTR_MOBILE_SLOT
-                    ) === '1'
-                ) {
-                    continue;
-                }
-
-
-                if (
-                    !isMobileReservedGeometry(
-                        slot,
-                        parentRect
-                    )
-                ) {
-                    continue;
-                }
-
-
-                slot.setAttribute(
-                    ATTR_MOBILE_SLOT,
-                    '1'
-                );
-
-
-                debug(
-                    'repeated mobile slot confirmed',
-                    {
-                        signature,
-                        slot
-                    }
-                );
-            }
-        }
-    }
-
-
-    /*
-     * ============================================================
-     * 13. Article singleton slot
-     * ============================================================
-     *
-     * 본문 중간에 한 개만 들어가는 빈 광고.
-     */
-
-    function scanArticleSingletonSlots(
-        parent,
-        parentRect
-    ) {
-        for (
-            const slot of
-            parent.children
-        ) {
-            if (!isDiv(slot))
-                continue;
-
-
-            if (
-                slot.getAttribute(
-                    ATTR_MOBILE_SLOT
-                ) === '1'
-            ) {
-                continue;
-            }
-
-
-            if (
-                !isMobileReservedGeometry(
-                    slot,
-                    parentRect
-                )
-            ) {
-                continue;
-            }
-
-
-            /*
-             * 본문 중간 singleton은
-             * 빈 placeholder만 선제 차단.
-             */
-            if (
-                cleanText(
-                    slot.textContent
-                ) !== ''
-            ) {
-                continue;
-            }
-
-
-            if (
-                containsForbiddenEmptySlotContent(
-                    slot
-                )
-            ) {
-                continue;
-            }
-
-
-            const previous =
-                findMeaningfulSibling(
-                    slot.previousElementSibling,
+                !neighbor(
+                    shell.previousElementSibling,
                     -1
-                );
-
-            const next =
-                findMeaningfulSibling(
-                    slot.nextElementSibling,
+                ) ||
+                !neighbor(
+                    shell.nextElementSibling,
                     1
-                );
-
-
-            if (
-                !previous ||
-                !next
-            ) {
-                continue;
-            }
-
-
-            slot.setAttribute(
-                ATTR_MOBILE_SLOT,
-                '1'
-            );
-
-
-            debug(
-                'article singleton slot confirmed',
-                slot
-            );
-        }
-    }
-
-
-    /*
-     * ============================================================
-     * 14. Top/standalone mobile slot scan
-     * ============================================================
-     *
-     * 2.5.0의 사각지대였던 부분.
-     *
-     * 긴 article sequence가 아니어도
-     * 전체 DOM에서 안전 조건을 만족하는 full-width
-     * empty reserved slot을 찾는다.
-     */
-
-    function scanStandaloneMobileSlots() {
-        if (!MOBILE_UA)
-            return;
-
-
-        for (
-            const slot of
-            document.querySelectorAll('div')
-        ) {
-            if (
-                !looksSafeAsStandaloneEmptySlot(
-                    slot
                 )
             ) {
                 continue;
             }
 
-
-            /*
-             * 여기까지 통과하면 현재 route에서 sticky.
-             */
-            slot.setAttribute(
-                ATTR_MOBILE_SLOT,
-                '1'
-            );
-
-
-            debug(
-                'standalone mobile slot confirmed',
-                slot
-            );
+            provisional(shell);
         }
     }
 
 
     /*
      * ============================================================
-     * 15. ResizeObserver
-     * ============================================================
-     *
-     * iOS에서:
-     *
-     * 0px
-     * ↓
-     * 임시 높이
-     * ↓
-     * 200px대 검은 슬롯
-     *
-     * 처럼 나중에 layout이 확정되는 경우 대응.
-     *
-     * ResizeObserver에서는 직접 숨기지 않고
-     * 전체 안전 판정을 다시 예약한다.
-     */
-
-    const resizeObserved =
-        new WeakSet();
-
-
-    let resizeObserver =
-        null;
-
-
-    function getResizeObserver() {
-        if (resizeObserver)
-            return resizeObserver;
-
-
-        if (
-            typeof ResizeObserver !==
-            'function'
-        ) {
-            return null;
-        }
-
-
-        resizeObserver =
-            new ResizeObserver(
-                () => {
-                    scheduleScan();
-                }
-            );
-
-
-        return resizeObserver;
-    }
-
-
-    /*
-     * 폭이 넓은 container의 direct div children을 관찰한다.
-     *
-     * 아직 height=0이어도 관찰하므로
-     * 나중에 216/250px로 커지는 순간을 잡을 수 있다.
-     */
-
-    function registerResizeTargets() {
-        if (!MOBILE_UA)
-            return;
-
-
-        const ro =
-            getResizeObserver();
-
-
-        if (!ro)
-            return;
-
-
-        for (
-            const parent of
-            document.querySelectorAll('div')
-        ) {
-            const parentRect =
-                parent.getBoundingClientRect();
-
-
-            if (
-                parentRect.width <
-                window.innerWidth * 0.70
-            ) {
-                continue;
-            }
-
-
-            /*
-             * 너무 큰 최상위 root 직접 관찰은 제외.
-             */
-            if (
-                parent === document.body ||
-                parent === document.documentElement ||
-                parent.id === 'app'
-            ) {
-                continue;
-            }
-
-
-            /*
-             * 자식이 지나치게 많은 매우 큰 root에서
-             * 모든 요소를 observe하는 것 방지.
-             */
-            if (
-                parent.children.length > 120
-            ) {
-                continue;
-            }
-
-
-            for (
-                const child of
-                parent.children
-            ) {
-                if (!isDiv(child))
-                    continue;
-
-
-                if (
-                    resizeObserved.has(
-                        child
-                    )
-                ) {
-                    continue;
-                }
-
-
-                const rect =
-                    child.getBoundingClientRect();
-
-
-                /*
-                 * 0px loading slot도 포함하고,
-                 * 폭이 너무 작은 UI 요소는 제외.
-                 */
-                if (
-                    rect.width > 0 &&
-                    rect.width <
-                    parentRect.width * 0.80
-                ) {
-                    continue;
-                }
-
-
-                resizeObserved.add(
-                    child
-                );
-
-
-                try {
-                    ro.observe(
-                        child
-                    );
-                } catch {
-                    // ignored
-                }
-            }
-        }
-    }
-
-
-    /*
-     * ============================================================
-     * 16. Mobile master scan
+     * Scan
      * ============================================================
      */
 
-    function scanMobileReservedSlots() {
-        if (!MOBILE_UA)
-            return;
-
-
-        /*
-         * 나중에 크기가 바뀌는 후보 등록.
-         */
-        registerResizeTargets();
-
-
-        /*
-         * A.
-         * 긴 본문 안의 반복/단독 광고.
-         */
-        for (
-            const parent of
-            document.querySelectorAll(
-                'div'
-            )
-        ) {
-            if (
-                !isArticleSequenceParent(
-                    parent
-                )
-            ) {
-                continue;
-            }
-
-
-            const parentRect =
-                parent.getBoundingClientRect();
-
-
-            scanRepeatedMobileSlots(
-                parent,
-                parentRect
-            );
-
-
-            scanArticleSingletonSlots(
-                parent,
-                parentRect
-            );
-        }
-
-
-        /*
-         * B.
-         * 제목/분류 아래 등에 독립적으로 생기는
-         * iOS/Android 상단 검은 광고.
-         */
-        scanStandaloneMobileSlots();
-    }
-
-
-    /*
-     * ============================================================
-     * 17. PowerLink master scan
-     * ============================================================
-     */
-
-    function scanPowerLinks() {
-        for (
-            const root of
-            document.querySelectorAll(
-                'div[style]'
-            )
-        ) {
-            if (
-                !isExactPowerLinkRoot(
-                    root
-                )
-            ) {
-                continue;
-            }
-
-
-            markPowerLink(
-                root
-            );
-
-
-            if (MOBILE_UA) {
-                markPowerLinkShell(
-                    root
-                );
-            }
-        }
-    }
-
-
-    /*
-     * ============================================================
-     * 18. Main scan
-     * ============================================================
-     */
-
-    function runScan() {
+    function scan() {
         try {
-            scanPowerLinks();
-
-
-            if (MOBILE_UA) {
-                scanMobileReservedSlots();
-            }
-
-        } catch (error) {
             /*
-             * userscript 내부 에러가 사이트 앱으로
-             * 절대 전파되지 않는다.
+             * exact PowerLink는 CSS가 이미 가리지만,
+             * 모바일 shell/provisional 승격을 위해 찾는다.
              */
-            console.error(
-                '[PowerLink] scan failed safely:',
-                error
-            );
-        }
-    }
-
-
-    /*
-     * ============================================================
-     * 19. Scheduler
-     * ============================================================
-     */
-
-    let scanTimer =
-        null;
-
-
-    function scheduleScan() {
-        if (
-            scanTimer !== null
-        ) {
-            return;
-        }
-
-
-        /*
-         * mutation / resize가 몰리더라도
-         * 한 번으로 합친다.
-         */
-        scanTimer =
-            setTimeout(
-                () => {
-                    scanTimer =
-                        null;
-
-                    runScan();
-                },
-                80
-            );
-    }
-
-
-    /*
-     * ============================================================
-     * 20. Route cleanup
-     * ============================================================
-     *
-     * Sticky 해제는 오직 URL 변경 때만.
-     *
-     * 같은 URL에서 광고 내부 DOM이 어떻게 바뀌든
-     * 이미 확정한 슬롯은 절대 되살리지 않는다.
-     */
-
-    function clearMarksForRouteChange() {
-        try {
             for (
                 const el of
-                document.querySelectorAll(
-                    `[${ATTR_POWERLINK}],` +
-                    `[${ATTR_POWERLINK_SHELL}],` +
-                    `[${ATTR_MOBILE_SLOT}]`
-                )
+                document.querySelectorAll('div[style]')
             ) {
-                el.removeAttribute(
-                    ATTR_POWERLINK
-                );
-
-                el.removeAttribute(
-                    ATTR_POWERLINK_SHELL
-                );
-
-                el.removeAttribute(
-                    ATTR_MOBILE_SLOT
-                );
+                if (isPowerLink(el))
+                    handlePowerLink(el);
             }
 
+            scanMobileSlots();
 
-            debug(
-                'sticky marks cleared'
-            );
-
-        } catch (error) {
+        } catch (e) {
             console.error(
-                '[PowerLink] cleanup failed safely:',
-                error
+                '[PowerLink] scan failed safely:',
+                e
             );
+        }
+    }
+
+
+    function schedule() {
+        if (scheduled)
+            return;
+
+        scheduled = true;
+
+        setTimeout(() => {
+            scheduled = false;
+            scan();
+        }, 80);
+    }
+
+
+    /*
+     * ============================================================
+     * ResizeObserver
+     * ============================================================
+     *
+     * 검은 slot이 0px -> 200~250px로 늦게 커지는 경우.
+     */
+
+    const observed = new WeakSet();
+
+    const resizeObserver =
+        MOBILE && typeof ResizeObserver === 'function'
+            ? new ResizeObserver(schedule)
+            : null;
+
+
+    function observeWideDivs() {
+        if (!resizeObserver)
+            return;
+
+        let count = 0;
+
+        for (const el of document.querySelectorAll('div')) {
+            if (
+                count >= 600 ||
+                observed.has(el)
+            ) {
+                continue;
+            }
+
+            const parent = el.parentElement;
+
+            if (!parent)
+                continue;
+
+            const r = el.getBoundingClientRect();
+            const p = parent.getBoundingClientRect();
+
+            if (
+                p.width < innerWidth * .65 ||
+                (
+                    r.width > 0 &&
+                    r.width < p.width * .80
+                )
+            ) {
+                continue;
+            }
+
+            observed.add(el);
+            resizeObserver.observe(el);
+
+            count++;
         }
     }
 
 
     /*
      * ============================================================
-     * 21. MutationObserver
+     * Bootstrap
      * ============================================================
      */
 
-    let mutationObserver =
-        null;
-
-
-    function startMutationObserver() {
-        if (
-            !document.documentElement ||
-            mutationObserver
-        ) {
-            return;
-        }
-
-
+    function start() {
         installCSS();
 
-
-        mutationObserver =
-            new MutationObserver(
-                () => {
-                    /*
-                     * callback 내부에서 페이지 DOM을
-                     * 뜯어고치지 않는다.
-                     *
-                     * 재검사만 예약.
-                     */
-                    scheduleScan();
-                }
-            );
-
-
-        mutationObserver.observe(
+        new MutationObserver(() => {
+            observeWideDivs();
+            schedule();
+        }).observe(
             document.documentElement,
             {
                 childList: true,
                 subtree: true,
-
                 attributes: true,
-
                 attributeFilter: [
                     'style',
                     'href',
@@ -1710,65 +656,28 @@
                     'data-src',
                     'data-doc',
                     'data-filesize'
-                ],
-
-                characterData: true
+                ]
             }
         );
 
-
-        scheduleScan();
-
-
-        debug(
-            'MutationObserver installed',
-            {
-                mobileUA:
-                    MOBILE_UA,
-
-                ua:
-                    navigator.userAgent
-            }
-        );
+        observeWideDivs();
+        schedule();
     }
 
 
-    /*
-     * ============================================================
-     * 22. document-start bootstrap
-     * ============================================================
-     */
+    if (document.documentElement) {
+        start();
+    } else {
+        const boot =
+            new MutationObserver(() => {
+                if (!document.documentElement)
+                    return;
 
-    function bootstrap() {
-        if (
-            document.documentElement
-        ) {
-            startMutationObserver();
+                boot.disconnect();
+                start();
+            });
 
-            return;
-        }
-
-
-        const bootstrapObserver =
-            new MutationObserver(
-                () => {
-                    if (
-                        !document.documentElement
-                    ) {
-                        return;
-                    }
-
-
-                    bootstrapObserver
-                        .disconnect();
-
-
-                    startMutationObserver();
-                }
-            );
-
-
-        bootstrapObserver.observe(
+        boot.observe(
             document,
             {
                 childList: true,
@@ -1778,130 +687,61 @@
     }
 
 
-    bootstrap();
-
-
     /*
      * ============================================================
-     * 23. Late scans
+     * Slow fallback
      * ============================================================
      */
 
-    document.addEventListener(
-        'DOMContentLoaded',
-        scheduleScan,
-        {
-            once: true
-        }
-    );
-
-
-    window.addEventListener(
-        'load',
-        scheduleScan,
-        {
-            once: true
-        }
-    );
-
-
-    window.addEventListener(
-        'pageshow',
-        scheduleScan
-    );
-
-
-    /*
-     * iOS/Android의 늦은 광고 layout 확정에 대한
-     * 최종 fallback.
-     *
-     * Mobile UA에서만.
-     */
-    if (MOBILE_UA) {
-        setInterval(
-            scheduleScan,
-            1500
-        );
+    if (MOBILE) {
+        setInterval(() => {
+            observeWideDivs();
+            schedule();
+        }, 1200);
     }
 
 
     /*
      * ============================================================
-     * 24. CSR route watcher
+     * CSR route change
      * ============================================================
-     *
-     * Vue router / history.pushState를 monkey patch하지 않는다.
      */
 
-    let previousURL =
-        location.href;
+    setInterval(() => {
+        if (location.href === lastURL)
+            return;
+
+        lastURL = location.href;
 
 
-    setInterval(
-        () => {
-            const currentURL =
-                location.href;
+        /*
+         * 이전 route의 timer 종료.
+         */
+        for (const id of timers.values())
+            clearTimeout(id);
+
+        timers.clear();
 
 
-            if (
-                currentURL ===
-                previousURL
-            ) {
-                return;
-            }
+        /*
+         * 이전 route의 차단 mark 전부 해제.
+         */
+        document
+            .querySelectorAll(`[${ATTR}]`)
+            .forEach(el =>
+                el.removeAttribute(ATTR)
+            );
 
 
-            previousURL =
-                currentURL;
+        /*
+         * timeout 후 복원된 후보 기록도 새 route에서는 초기화.
+         */
+        rejected =
+            new WeakSet();
 
 
-            /*
-             * 이전 route에서 확정한 sticky mark만 제거.
-             */
-            clearMarksForRouteChange();
+        schedule();
 
-
-            /*
-             * 새 route는 처음부터 다시 독립 판정.
-             */
-            scheduleScan();
-
-        },
-        500
-    );
-
-
-    /*
-     * ============================================================
-     * 25. Safety policy
-     * ============================================================
-     *
-     * 절대 하지 않음:
-     *
-     * - Vue hook
-     * - Vuex hook
-     * - store.commit 수정
-     * - INITIAL_STATE 수정
-     * - fetch hook
-     * - XMLHttpRequest hook
-     * - WebSocket hook
-     * - googletag / GPT 수정
-     * - router monkey patch
-     * - history.pushState patch
-     * - DOM remove()
-     * - replaceWith()
-     * - innerHTML 교체
-     * - 광고 payload 변조
-     *
-     *
-     * 애매한 경우:
-     *     광고를 놓친다.
-     *
-     * 광고로 확정한 경우:
-     *     현재 URL에서 sticky display:none.
-     *
-     * CSR URL 변경:
-     *     mark 초기화 후 다시 판정.
-     */
+    }, 500);
 
 })();
