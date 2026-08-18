@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NamuWiki PowerLink Blocker
 // @namespace    List-KR
-// @version      2.7.0
+// @version      2.7.1
 // @description  Block NamuWiki PowerLink and mobile reserved ad slots
 // @match        https://namu.wiki/*
 // @updateURL    https://raw.githubusercontent.com/List-KR/namuwiki-powerlink-blocker/refs/heads/main/namuwiki-powerlink-blocker.user.js
@@ -305,7 +305,7 @@
         if (
             el.querySelector(
                 'article,main,h1,h2,h3,h4,h5,h6,' +
-                'p,blockquote,ul,ol,pre,table,' +
+                'p,blockquote,ul,ol,pre,table,time,' +
                 'form,input,textarea,select'
             )
         ) {
