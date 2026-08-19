@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         NamuWiki PowerLink Blocker
 // @namespace    List-KR
-// @version      2.8.0
+// @version      2.8.1
 // @description  Block NamuWiki PowerLink and reserved ad slots
 // @match        https://namu.wiki/*
-// @updateURL    https://cdn.jsdelivr.net/gh/List-KR/namuwiki-powerlink-blocker/namuwiki-powerlink-blocker.user.js
-// @downloadURL  https://cdn.jsdelivr.net/gh/List-KR/namuwiki-powerlink-blocker/namuwiki-powerlink-blocker.user.js
+// @updateURL    https://raw.githubusercontent.com/List-KR/namuwiki-powerlink-blocker/refs/heads/main/namuwiki-powerlink-blocker.user.js
+// @downloadURL  https://raw.githubusercontent.com/List-KR/namuwiki-powerlink-blocker/refs/heads/main/namuwiki-powerlink-blocker.user.js
 // @run-at       document-start
 // @grant        none
 // ==/UserScript==
@@ -53,7 +53,10 @@
             ),
             div[style*="width: auto"]:has(
                 > table a[href^="#s-"] img[data-doc][data-filesize]
-            ),
+            ) {
+                display: none !important;
+            }
+
             [${ATTR}] {
                 display: none !important;
             }
@@ -185,8 +188,10 @@
         if (!el.isConnected)
             return;
 
-        if (isPowerLink(el))
+        if (isPowerLink(el)) {
             handlePowerLink(el);
+            hide(el);
+        }
 
         if (!el.closest(`[${ATTR}]`) && isReservedSlot(el))
             hide(el);
@@ -230,6 +235,12 @@
     function schedule() {
         if (!timer)
             timer = setTimeout(flush, 80);
+    }
+
+
+    function rescan() {
+        addTree(document.documentElement);
+        schedule();
     }
 
 
@@ -293,8 +304,7 @@
                 ]
             }
         );
-        addTree(document.documentElement);
-        schedule();
+        rescan();
     }
 
 
@@ -311,4 +321,9 @@
 
         observer.observe(document, { childList: true, subtree: true });
     }
+
+
+    window.addEventListener('load', rescan, { once: true });
+    window.addEventListener('pageshow', rescan);
+    window.addEventListener('resize', rescan, { passive: true });
 })();
