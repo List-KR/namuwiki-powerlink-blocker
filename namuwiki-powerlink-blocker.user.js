@@ -4,8 +4,8 @@
 // @version      2.8.0
 // @description  Block NamuWiki PowerLink and reserved ad slots
 // @match        https://namu.wiki/*
-// @updateURL    https://raw.githubusercontent.com/List-KR/namuwiki-powerlink-blocker/refs/heads/main/namuwiki-powerlink-blocker.user.js
-// @downloadURL  https://raw.githubusercontent.com/List-KR/namuwiki-powerlink-blocker/refs/heads/main/namuwiki-powerlink-blocker.user.js
+// @updateURL    https://cdn.jsdelivr.net/gh/List-KR/namuwiki-powerlink-blocker/namuwiki-powerlink-blocker.user.js
+// @downloadURL  https://cdn.jsdelivr.net/gh/List-KR/namuwiki-powerlink-blocker/namuwiki-powerlink-blocker.user.js
 // @run-at       document-start
 // @grant        none
 // ==/UserScript==

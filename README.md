@@ -8,7 +8,7 @@ Chrome의 경우 Manifest V3 도입으로 인해 유저스크립트의 원활한
 
 유저스크립트 확장 프로그램을 설치하셨다면 아래 링크를 클릭하여 유저스크립트를 추가해주세요. 호환되는 확장 프로그램이 설치된 경우 자동으로 감지합니다.
 
-**https://github.com/List-KR/namuwiki-powerlink-blocker/raw/refs/heads/main/namuwiki-powerlink-blocker.user.js**
+**https://cdn.jsdelivr.net/gh/List-KR/namuwiki-powerlink-blocker/namuwiki-powerlink-blocker.user.js**
 
 # 주의 사항
 나무위키 측에서 수시로 파워링크 차단을 어렵게 하기 위해 구조를 변경하고 있으므로, 오탐지가 발생할 수 있습니다.
