@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NamuWiki PowerLink Blocker
 // @namespace    List-KR
-// @version      2.8.1
+// @version      2.8.2
 // @description  Block NamuWiki PowerLink and reserved ad slots
 // @match        https://namu.wiki/*
 // @updateURL    https://raw.githubusercontent.com/List-KR/namuwiki-powerlink-blocker/refs/heads/main/namuwiki-powerlink-blocker.user.js
@@ -37,6 +37,7 @@
             .replace(/\u00a0/g, '')
             .replace(/\s+/g, ' ')
             .trim();
+
 
     function routeKey() {
         return location.pathname + location.search;
@@ -128,11 +129,45 @@
     }
 
 
+    function findComponentShell(root) {
+        const scopes = [...root.attributes]
+            .map(attr => attr.name)
+            .filter(name => /^data-v-[0-9a-f]+$/i.test(name));
+
+        if (!scopes.length)
+            return null;
+
+        let shell = root;
+
+        for (let i = 0; i < 8; i++) {
+            const parent = shell.parentElement;
+
+            if (!isDiv(parent) ||
+                parent === document.body ||
+                parent === document.documentElement ||
+                parent.id === 'app')
+                break;
+
+            if (!scopes.some(scope => parent.hasAttribute(scope)))
+                break;
+
+            shell = parent;
+        }
+
+        return shell === root ? null : shell;
+    }
+
+
     function handlePowerLink(root) {
+        const componentShell = findComponentShell(root);
+
+        if (componentShell)
+            hide(componentShell);
+
         if (!MOBILE)
             return;
 
-        let path = root;
+        let path = componentShell || root;
         let shell = null;
 
         for (let i = 0; i < 8; i++) {
@@ -217,6 +252,7 @@
 
         node.querySelectorAll('div')
             .forEach(el => pending.add(el));
+
         addAncestors(node);
     }
 
@@ -251,8 +287,10 @@
             return;
 
         route = current;
+
         document.querySelectorAll(`[${ATTR}]`)
             .forEach(el => el.removeAttribute(ATTR));
+
         pending.clear();
         addTree(document.documentElement);
     }
@@ -290,6 +328,7 @@
 
     function start() {
         installCSS();
+
         new MutationObserver(onMutations).observe(
             document.documentElement,
             {
@@ -304,6 +343,7 @@
                 ]
             }
         );
+
         rescan();
     }
 
@@ -319,7 +359,10 @@
             start();
         });
 
-        observer.observe(document, { childList: true, subtree: true });
+        observer.observe(document, {
+            childList: true,
+            subtree: true
+        });
     }
 
 
