@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NamuWiki PowerLink Blocker
 // @namespace    List-KR
-// @version      2.8.2
+// @version      2.8.3
 // @description  Block NamuWiki PowerLink and reserved ad slots
 // @match        https://namu.wiki/*
 // @updateURL    https://raw.githubusercontent.com/List-KR/namuwiki-powerlink-blocker/refs/heads/main/namuwiki-powerlink-blocker.user.js
@@ -37,6 +37,11 @@
             .replace(/\u00a0/g, '')
             .replace(/\s+/g, ' ')
             .trim();
+
+    const hasContent = el =>
+        cleanText(el) ||
+        el.matches(protectedContent) ||
+        el.querySelector(protectedContent);
 
 
     function routeKey() {
@@ -80,7 +85,7 @@
     }
 
 
-    function mobileGeometry(el, rect = el.getBoundingClientRect()) {
+    function mobileGeometry(el, rect) {
         const parentWidth = el.parentElement
             ?.getBoundingClientRect().width || 0;
         const ratio = rect.height / rect.width;
@@ -100,8 +105,7 @@
         if (!isDiv(el) ||
             el.hasAttribute(ATTR) ||
             el.childElementCount > 12 ||
-            cleanText(el) ||
-            el.querySelector(protectedContent))
+            hasContent(el))
             return false;
 
         const rect = el.getBoundingClientRect();
@@ -129,45 +133,38 @@
     }
 
 
-    function findComponentShell(root) {
+    function findAdShell(root) {
         const scopes = [...root.attributes]
             .map(attr => attr.name)
             .filter(name => /^data-v-[0-9a-f]+$/i.test(name));
-
-        if (!scopes.length)
-            return null;
-
         let shell = root;
 
-        for (let i = 0; i < 8; i++) {
+        for (let i = 0; scopes.length && i < 8; i++) {
             const parent = shell.parentElement;
 
-            if (!isDiv(parent) ||
-                parent === document.body ||
-                parent === document.documentElement ||
-                parent.id === 'app')
+            if (!isDiv(parent) || parent.id === 'app')
                 break;
 
-            if (!scopes.some(scope => parent.hasAttribute(scope)))
+            if (!scopes.some(scope => parent.hasAttribute(scope)) ||
+                [...parent.children].some(child =>
+                    child !== shell && hasContent(child)))
                 break;
 
             shell = parent;
         }
 
-        return shell === root ? null : shell;
+        return shell;
     }
 
 
     function handlePowerLink(root) {
-        const componentShell = findComponentShell(root);
-
-        if (componentShell)
-            hide(componentShell);
+        const adShell = findAdShell(root);
+        hide(adShell);
 
         if (!MOBILE)
             return;
 
-        let path = componentShell || root;
+        let path = adShell;
         let shell = null;
 
         for (let i = 0; i < 8; i++) {
@@ -181,10 +178,7 @@
 
             const parent = path.parentElement;
 
-            if (!isDiv(parent) ||
-                parent === document.body ||
-                parent === document.documentElement ||
-                parent.id === 'app')
+            if (!isDiv(parent) || parent.id === 'app')
                 break;
 
             let occupied = false;
@@ -195,7 +189,7 @@
 
                 const rect = child.getBoundingClientRect();
 
-                if ((rect.width > 20 && rect.height > 12) || cleanText(child)) {
+                if ((rect.width > 20 && rect.height > 12) || hasContent(child)) {
                     occupied = true;
                     break;
                 }
@@ -223,10 +217,8 @@
         if (!el.isConnected)
             return;
 
-        if (isPowerLink(el)) {
+        if (isPowerLink(el))
             handlePowerLink(el);
-            hide(el);
-        }
 
         if (!el.closest(`[${ATTR}]`) && isReservedSlot(el))
             hide(el);
