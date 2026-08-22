@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NamuWiki PowerLink Blocker
 // @namespace    List-KR
-// @version      2.9.0
+// @version      2.9.1
 // @description  Block NamuWiki PowerLink
 // @match        https://namu.wiki/*
 // @updateURL    https://raw.githubusercontent.com/List-KR/namuwiki-powerlink-blocker/refs/heads/main/namuwiki-powerlink-blocker.user.js
@@ -103,14 +103,30 @@
     });
   }
 
+  function scanAncestors(node) {
+    let el = node?.parentElement;
+
+    for (let i = 0; el && i < 10; i++, el = el.parentElement) {
+      if (!isAdMarker(el))
+        continue;
+
+      hide(findShell(el));
+      break;
+    }
+  }
+
   function onMutations(records) {
     for (const record of records) {
       if (record.type === 'attributes') {
         scan(record.target);
+        scanAncestors(record.target);
         continue;
       }
 
-      record.addedNodes.forEach(scan);
+      record.addedNodes.forEach(node => {
+        scan(node);
+        scanAncestors(node);
+      });
     }
   }
 
@@ -120,7 +136,13 @@
     childList: true,
     subtree: true,
     attributes: true,
-    attributeFilter: ['id', 'style']
+    attributeFilter: [
+      'id',
+      'style',
+      'href',
+      'data-doc',
+      'data-filesize'
+    ]
   });
 
   scan(document.documentElement);
