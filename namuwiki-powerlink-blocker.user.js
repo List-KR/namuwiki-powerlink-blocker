@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NamuWiki PowerLink Blocker
 // @namespace    List-KR
-// @version      2.9.2
+// @version      2.9.3
 // @description  Block NamuWiki PowerLink
 // @match        https://namu.wiki/*
 // @updateURL    https://raw.githubusercontent.com/List-KR/namuwiki-powerlink-blocker/refs/heads/main/namuwiki-powerlink-blocker.user.js
@@ -65,12 +65,26 @@
   }
 
   function findShell(root) {
+    if (isDynamicAdMount(root))
+      return root.parentElement.parentElement;
+
+    if (root.id.startsWith('_gad_')) {
+      const shell = root.parentElement?.parentElement?.parentElement;
+
+      if (isDiv(shell) && !hasProtectedContent(shell))
+        return shell;
+    }
+
+    const scopes = [...root.attributes]
+      .map(attr => attr.name)
+      .filter(name => /^data-v-[0-9a-f]+$/i.test(name));
     let shell = root;
 
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; scopes.length && i < 8; i++) {
       const parent = shell.parentElement;
 
-      if (!isDiv(parent) ||
+      if (!isDiv(parent) || parent.id === 'app' ||
+        !scopes.some(scope => parent.hasAttribute(scope)) ||
         [...parent.children].some(child =>
           child !== shell && hasProtectedContent(child)))
         break;
@@ -103,14 +117,30 @@
     });
   }
 
+  function scanAncestors(node) {
+    let el = node?.parentElement;
+
+    for (let i = 0; el && i < 10; i++, el = el.parentElement) {
+      if (!isAdMarker(el))
+        continue;
+
+      hide(findShell(el));
+      break;
+    }
+  }
+
   function onMutations(records) {
     for (const record of records) {
       if (record.type === 'attributes') {
         scan(record.target);
+        scanAncestors(record.target);
         continue;
       }
 
-      record.addedNodes.forEach(scan);
+      record.addedNodes.forEach(node => {
+        scan(node);
+        scanAncestors(node);
+      });
     }
   }
 
@@ -120,7 +150,13 @@
     childList: true,
     subtree: true,
     attributes: true,
-    attributeFilter: ['id', 'style']
+    attributeFilter: [
+      'id',
+      'style',
+      'href',
+      'data-doc',
+      'data-filesize'
+    ]
   });
 
   scan(document.documentElement);
