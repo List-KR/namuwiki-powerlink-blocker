@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NamuWiki PowerLink Blocker
 // @namespace    List-KR
-// @version      2.9.0
+// @version      2.9.2
 // @description  Block NamuWiki PowerLink
 // @match        https://namu.wiki/*
 // @updateURL    https://raw.githubusercontent.com/List-KR/namuwiki-powerlink-blocker/refs/heads/main/namuwiki-powerlink-blocker.user.js
