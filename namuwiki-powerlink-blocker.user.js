@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NamuWiki PowerLink Blocker
 // @namespace    List-KR
-// @version      2.9.3
+// @version      2.9.4
 // @description  Block NamuWiki PowerLink
 // @match        https://namu.wiki/*
 // @updateURL    https://raw.githubusercontent.com/List-KR/namuwiki-powerlink-blocker/refs/heads/main/namuwiki-powerlink-blocker.user.js
@@ -14,11 +14,11 @@
   'use strict';
 
   const protectedContent =
-    'article,main,h1,h2,h3,h4,h5,h6,' +
+    'article,main,header,footer,nav,aside,h1,h2,h3,h4,h5,h6,' +
     'p,blockquote,ul,ol,pre,table,time,' +
     'form,input,textarea,select,' +
-    'figure,picture,video,audio,canvas,' +
-    'img[data-doc],img[data-filesize],[id^="fn-"]';
+    'figure,picture,video,audio,canvas,iframe,object,embed,' +
+    'img[data-doc],img[data-filesize],[id]';
 
   const isDiv = el =>
     el?.nodeType === 1 && el.localName === 'div';
@@ -27,6 +27,62 @@
     el.matches(protectedContent) ||
     el.querySelector(protectedContent);
 
+  const knownAdShells = new WeakSet();
+  const hiddenShells = new Map();
+
+  const getScopes = el => [...el.attributes]
+    .map(attr => attr.name)
+    .filter(name => /^data-v-[0-9a-f]+$/i.test(name));
+
+  const hasDirectText = el => [...el.childNodes].some(node =>
+    node.nodeType === 3 && node.textContent.trim());
+
+  function isEmptyShell(el) {
+    return !el.textContent.trim() &&
+      !el.querySelector(':not(div)');
+  }
+
+  function isKnownEmptyAdShell(el) {
+    return knownAdShells.has(el) && isEmptyShell(el);
+  }
+
+  function isEmptySectionSlot(el) {
+    // An unmounted component can leave only a Vue comment between article
+    // sections. Infer that boundary from scope relationships, never hashes.
+    if (el.id || el.hasAttribute('role') || el.hasAttribute('aria-label') ||
+      el.hasAttribute('aria-labelledby') || el.childElementCount ||
+      el.textContent.trim() ||
+      ![...el.childNodes].some(node => node.nodeType === 8))
+      return false;
+
+    const parent = el.parentElement;
+    const before = el.previousElementSibling;
+    const after = el.nextElementSibling;
+    if (!isDiv(parent) || !isDiv(before) || !isDiv(after) ||
+      !before.textContent.trim() || !before.querySelector('a[href],p') ||
+      !after.querySelector('h2,h3,h4,h5,h6'))
+      return false;
+
+    const scopes = getScopes(el);
+    const articleScopes = getScopes(before).filter(scope =>
+      after.hasAttribute(scope));
+    if (!scopes.length || !articleScopes.length ||
+      scopes.some(scope => parent.hasAttribute(scope) ||
+        before.hasAttribute(scope) || after.hasAttribute(scope)))
+      return false;
+
+    // Pseudo-elements may contain actual labels or icons despite an empty DOM.
+    return ['::before', '::after'].every(pseudo => {
+      const content = getComputedStyle(el, pseudo).content;
+      return content === 'none' || content === 'normal' ||
+        content === '""' || content === "''";
+    });
+  }
+
+  const isExplicitAdMount = el =>
+    el.id.startsWith('_gad_') ||
+    el.classList.contains('vm-dynamic-placement');
+
   function isDynamicAdMount(el) {
     const parent = el.parentElement;
     const shell = parent?.parentElement;
@@ -34,6 +90,7 @@
     return (
       /_\d+$/.test(el.id) &&
       !el.childElementCount &&
+      !el.textContent.trim() &&
       isDiv(parent) &&
       parent.childElementCount === 1 &&
       isDiv(shell) &&
@@ -48,8 +105,10 @@
     if (!isDiv(el))
       return false;
 
-    if (el.id.startsWith('_gad_') ||
-      el.style.color.startsWith('rgba(') ||
+    if (isExplicitAdMount(el) ||
+      isKnownEmptyAdShell(el) ||
+      isEmptySectionSlot(el) ||
+      (el.style.color.startsWith('rgba(') && !hasProtectedContent(el)) ||
       isDynamicAdMount(el))
       return true;
 
@@ -59,49 +118,102 @@
     return [...el.children].some(child =>
       child.localName === 'table' &&
       child.querySelector(
-        'a[href^="#s-"] img[data-doc][data-filesize]'
+        'a[href^="#"] img[data-doc][data-filesize]'
       )
     );
   }
 
   function findShell(root) {
-    if (isDynamicAdMount(root))
-      return root.parentElement.parentElement;
+    // Explicit markers must win over the generic /_\d+$/ heuristic.
+    // _gad_inarticle_2 matches both, which previously left its outer shell.
+    if (isExplicitAdMount(root) || isDynamicAdMount(root)) {
+      let shell = root;
 
-    if (root.id.startsWith('_gad_')) {
-      const shell = root.parentElement?.parentElement?.parentElement;
+      for (let i = 0; i < 8; i++) {
+        const parent = shell.parentElement;
 
-      if (isDiv(shell) && !hasProtectedContent(shell))
-        return shell;
+        if (!isDiv(parent) || parent.id ||
+          parent.matches(protectedContent) || parent.hasAttribute('role') ||
+          parent.childElementCount !== 1 || hasDirectText(parent))
+          break;
+
+        shell = parent;
+      }
+
+      knownAdShells.add(shell);
+      return shell;
     }
 
-    const scopes = [...root.attributes]
-      .map(attr => attr.name)
-      .filter(name => /^data-v-[0-9a-f]+$/i.test(name));
+    if (isKnownEmptyAdShell(root) || isEmptySectionSlot(root))
+      return root;
+
+    const scopes = getScopes(root);
     let shell = root;
 
     for (let i = 0; scopes.length && i < 8; i++) {
       const parent = shell.parentElement;
 
-      if (!isDiv(parent) || parent.id === 'app' ||
+      if (!isDiv(parent) || parent.id ||
+        parent.matches(protectedContent) || parent.hasAttribute('role') ||
+        hasDirectText(parent) ||
         !scopes.some(scope => parent.hasAttribute(scope)) ||
         [...parent.children].some(child =>
-          child !== shell && hasProtectedContent(child)))
+          child !== shell &&
+          (hasProtectedContent(child) || child.textContent.trim())))
         break;
 
       shell = parent;
     }
 
+    knownAdShells.add(shell);
     return shell;
   }
 
-  function hide(el) {
-    if (!el ||
-      (el.style.getPropertyValue('display') === 'none' &&
-        el.style.getPropertyPriority('display') === 'important'))
+  function hide(el, marker) {
+    if (!el)
+      return;
+
+    if (!hiddenShells.has(el)) {
+      hiddenShells.set(el, {
+        value: el.style.getPropertyValue('display'),
+        priority: el.style.getPropertyPriority('display'),
+        markers: new Set()
+      });
+    }
+
+    hiddenShells.get(el).markers.add(marker);
+
+    if (el.style.getPropertyValue('display') === 'none' &&
+      el.style.getPropertyPriority('display') === 'important')
       return;
 
     el.style.setProperty('display', 'none', 'important');
+  }
+
+  function recheckHiddenShells() {
+    for (const [shell, state] of hiddenShells) {
+      // A document-start scan can see a partially parsed layout. Restore
+      // it if later content makes it no longer an ad-only wrapper.
+      const stillAdOnly = shell.isConnected &&
+        ((knownAdShells.has(shell) && isEmptyShell(shell)) ||
+        [...state.markers].some(marker =>
+          shell.contains(marker) && isAdMarker(marker) &&
+          findShell(marker) === shell));
+
+      if (stillAdOnly)
+        continue;
+
+      if (shell.style.getPropertyValue('display') === 'none' &&
+        shell.style.getPropertyPriority('display') === 'important') {
+        if (state.value)
+          shell.style.setProperty('display', state.value, state.priority);
+        else
+          shell.style.removeProperty('display');
+      }
+
+      knownAdShells.delete(shell);
+      hiddenShells.delete(shell);
+    }
   }
 
   function scan(root) {
@@ -109,11 +221,11 @@
       return;
 
     if (isAdMarker(root))
-      hide(findShell(root));
+      hide(findShell(root), root);
 
     root.querySelectorAll('div').forEach(el => {
       if (isAdMarker(el))
-        hide(findShell(el));
+        hide(findShell(el), el);
     });
   }
 
@@ -124,18 +236,25 @@
       if (!isAdMarker(el))
         continue;
 
-      hide(findShell(el));
+      hide(findShell(el), el);
       break;
     }
   }
 
   function onMutations(records) {
+    recheckHiddenShells();
+
     for (const record of records) {
       if (record.type === 'attributes') {
         scan(record.target);
         scanAncestors(record.target);
         continue;
       }
+
+      // childList fires for removals too: the target can now be an empty
+      // ad shell even though addedNodes is empty.
+      scan(record.target);
+      scanAncestors(record.target);
 
       record.addedNodes.forEach(node => {
         scan(node);
@@ -149,9 +268,11 @@
   observer.observe(document, {
     childList: true,
     subtree: true,
+    characterData: true,
     attributes: true,
     attributeFilter: [
       'id',
+      'class',
       'style',
       'href',
       'data-doc',
