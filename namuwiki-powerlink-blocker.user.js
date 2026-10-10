@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NamuWiki PowerLink Blocker
 // @namespace    List-KR
-// @version      2.9.4
+// @version      2.9.5
 // @description  Block NamuWiki PowerLink
 // @match        https://namu.wiki/*
 // @updateURL    https://raw.githubusercontent.com/List-KR/namuwiki-powerlink-blocker/refs/heads/main/namuwiki-powerlink-blocker.user.js
@@ -115,7 +115,9 @@
     if (el.style.width !== 'auto')
       return false;
 
-    return [...el.children].some(child =>
+    // In-article PowerLink slots are mounted empty and filled lazily; the
+    // reserved min-height of their wrapper shows as a blank gap meanwhile.
+    return isEmptyShell(el) || [...el.children].some(child =>
       child.localName === 'table' &&
       child.querySelector(
         'a[href^="#"] img[data-doc][data-filesize]'
@@ -123,23 +125,27 @@
     );
   }
 
+  // Wrappers whose only child is the ad still carry margins/min-height.
+  function climbSingleChildWrappers(shell) {
+    for (let i = 0; i < 8; i++) {
+      const parent = shell.parentElement;
+
+      if (!isDiv(parent) || parent.id ||
+        parent.matches(protectedContent) || parent.hasAttribute('role') ||
+        parent.childElementCount !== 1 || hasDirectText(parent))
+        break;
+
+      shell = parent;
+    }
+
+    return shell;
+  }
+
   function findShell(root) {
     // Explicit markers must win over the generic /_\d+$/ heuristic.
     // _gad_inarticle_2 matches both, which previously left its outer shell.
     if (isExplicitAdMount(root) || isDynamicAdMount(root)) {
-      let shell = root;
-
-      for (let i = 0; i < 8; i++) {
-        const parent = shell.parentElement;
-
-        if (!isDiv(parent) || parent.id ||
-          parent.matches(protectedContent) || parent.hasAttribute('role') ||
-          parent.childElementCount !== 1 || hasDirectText(parent))
-          break;
-
-        shell = parent;
-      }
-
+      const shell = climbSingleChildWrappers(root);
       knownAdShells.add(shell);
       return shell;
     }
@@ -165,6 +171,9 @@
       shell = parent;
     }
 
+    // The scoped component sits inside unscoped layout wrappers
+    // (e.g. mobile in-article slot: margin 16px + min-height 250px).
+    shell = climbSingleChildWrappers(shell);
     knownAdShells.add(shell);
     return shell;
   }
