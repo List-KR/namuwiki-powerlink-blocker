@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NamuWiki PowerLink Blocker
 // @namespace    List-KR
-// @version      2.10.0
+// @version      2.9.6
 // @description  Block NamuWiki PowerLink
 // @match        https://namu.wiki/*
 // @updateURL    https://raw.githubusercontent.com/List-KR/namuwiki-powerlink-blocker/refs/heads/main/namuwiki-powerlink-blocker.user.js
@@ -28,18 +28,7 @@
     el.querySelector(protectedContent);
 
   const knownAdShells = new WeakSet();
-  const knownAdMarkers = new WeakSet();
   const hiddenShells = new Map();
-
-  // While streaming-parsing, a node with no next sibling may still receive
-  // children, so emptiness and single-child checks on it are not trustworthy.
-  const isComplete = el =>
-    document.readyState !== 'loading' || el.nextSibling !== null ||
-    (!!el.parentNode && isComplete(el.parentNode));
-
-  const adFill = 'iframe,ins,[id^="google_ads"],[id^="div-gpt"],' +
-    '[class^="vm-"],a[href*="adcr.naver.com"],a[href*="searchad.naver.com"],' +
-    'table a[href^="#"] img[data-doc][data-filesize]';
 
   const getScopes = el => [...el.attributes]
     .map(attr => attr.name)
@@ -47,11 +36,6 @@
 
   const hasDirectText = el => [...el.childNodes].some(node =>
     node.nodeType === 3 && node.textContent.trim());
-
-  // Wiki `#!wiki style` blocks carry plain text; ad slots carry link text only.
-  const hasTextOutsideLinks = el => hasDirectText(el) ||
-    [...el.querySelectorAll('*')].some(node =>
-      !node.closest('a[href]') && hasDirectText(node));
 
   function isEmptyShell(el) {
     return !el.textContent.trim() &&
@@ -61,13 +45,6 @@
   function isKnownEmptyAdShell(el) {
     return knownAdShells.has(el) && isEmptyShell(el);
   }
-
-  const hasNoPseudoContent = el =>
-    ['::before', '::after'].every(pseudo => {
-      const content = getComputedStyle(el, pseudo).content;
-      return content === 'none' || content === 'normal' ||
-        content === '""' || content === "''";
-    });
 
   function isEmptySectionSlot(el) {
     // An unmounted component can leave only a Vue comment between article
@@ -79,12 +56,6 @@
       return false;
 
     const parent = el.parentElement;
-
-    // The article component's own top slot: an empty wrapper directly under
-    // <article>, sharing its scope, holding only the unmounted ad's comment.
-    if (parent?.localName === 'article')
-      return hasNoPseudoContent(el);
-
     const before = el.previousElementSibling;
     const after = el.nextElementSibling;
     if (!isDiv(parent) || !isDiv(before) || !isDiv(after) ||
@@ -101,7 +72,11 @@
       return false;
 
     // Pseudo-elements may contain actual labels or icons despite an empty DOM.
-    return hasNoPseudoContent(el);
+    return ['::before', '::after'].every(pseudo => {
+      const content = getComputedStyle(el, pseudo).content;
+      return content === 'none' || content === 'normal' ||
+        content === '""' || content === "''";
+    });
   }
 
   const isExplicitAdMount = el =>
@@ -112,12 +87,8 @@
     const parent = el.parentElement;
     const shell = parent?.parentElement;
 
-    // shortcut: a name blocklist for Vue mount points; replace with a
-    // positive ad-slot pattern once the current id scheme is known.
     return (
       /_\d+$/.test(el.id) &&
-      !/modal|toast|tooltip|popover|popper|teleport|dialog|menu|overlay/i
-        .test(el.id) &&
       !el.childElementCount &&
       !el.textContent.trim() &&
       isDiv(parent) &&
@@ -130,23 +101,25 @@
     );
   }
 
+  function isPowerLink(el) {
+    // Current slots omit width:auto and wrap their table in a div.
+    return el.querySelector(
+      ':scope > div > table a[href^="#"] img[data-doc][data-filesize]'
+    ) && [...el.children].some(header =>
+      header.querySelector(':scope > div > span')?.textContent.trim() === '파워링크' &&
+      [...header.querySelectorAll(':scope > span > a[href^="#"]')].some(link =>
+        link.textContent.trim() === '광고등록')
+    );
+  }
+
   function isAdMarker(el) {
     if (!isDiv(el))
       return false;
 
-    // A known marker stays one while empty or ad-filled; wiki content that
-    // lands in a misjudged slot releases it.
-    if (isExplicitAdMount(el) || (knownAdMarkers.has(el) &&
-      (isEmptyShell(el) || el.querySelector(adFill))))
-      return true;
-
-    if (!isComplete(el))
-      return false;
-
-    if (isKnownEmptyAdShell(el) ||
+    if (isExplicitAdMount(el) || isPowerLink(el) ||
+      isKnownEmptyAdShell(el) ||
       isEmptySectionSlot(el) ||
-      (el.style.color.startsWith('rgba(') && !hasProtectedContent(el) &&
-        !hasTextOutsideLinks(el)) ||
+      (el.style.color.startsWith('rgba(') && !hasProtectedContent(el)) ||
       isDynamicAdMount(el))
       return true;
 
@@ -168,7 +141,7 @@
     for (let i = 0; i < 8; i++) {
       const parent = shell.parentElement;
 
-      if (!isDiv(parent) || !isComplete(parent) ||
+      if (!isDiv(parent) || parent.id ||
         parent.matches(protectedContent) || parent.hasAttribute('role') ||
         parent.childElementCount !== 1 || hasDirectText(parent))
         break;
@@ -197,7 +170,7 @@
     for (let i = 0; scopes.length && i < 8; i++) {
       const parent = shell.parentElement;
 
-      if (!isDiv(parent) || !isComplete(parent) ||
+      if (!isDiv(parent) || parent.id ||
         parent.matches(protectedContent) || parent.hasAttribute('role') ||
         hasDirectText(parent) ||
         !scopes.some(scope => parent.hasAttribute(scope)) ||
@@ -229,9 +202,6 @@
     }
 
     hiddenShells.get(el).markers.add(marker);
-    // Markers stay markers once filled: an ad slot that loaded its ad must
-    // not be restored because it is no longer empty.
-    knownAdMarkers.add(marker);
 
     if (el.style.getPropertyValue('display') === 'none' &&
       el.style.getPropertyPriority('display') === 'important')
@@ -245,8 +215,7 @@
       // A document-start scan can see a partially parsed layout. Restore
       // it if later content makes it no longer an ad-only wrapper.
       const stillAdOnly = shell.isConnected &&
-        ((knownAdShells.has(shell) &&
-          (isEmptyShell(shell) || shell.querySelector(adFill))) ||
+        ((knownAdShells.has(shell) && isEmptyShell(shell)) ||
         [...state.markers].some(marker =>
           shell.contains(marker) && isAdMarker(marker) &&
           findShell(marker) === shell));
@@ -295,22 +264,22 @@
   function onMutations(records) {
     recheckHiddenShells();
 
-    // Parser/hydration batches repeat the same target hundreds of times.
-    // Scanning the target covers its added nodes and, via scanAncestors,
-    // removals that left it empty.
-    const targets = new Set(records.map(record => record.target));
+    for (const record of records) {
+      if (record.type === 'attributes') {
+        scan(record.target);
+        scanAncestors(record.target);
+        continue;
+      }
 
-    if (targets.size > 200) {
-      scan(document.documentElement);
-      return;
-    }
+      // childList fires for removals too: the target can now be an empty
+      // ad shell even though addedNodes is empty.
+      scan(record.target);
+      scanAncestors(record.target);
 
-    for (const target of targets) {
-      scanAncestors(target);
-
-      if (![...targets].some(other =>
-        other !== target && other.contains(target)))
-        scan(target);
+      record.addedNodes.forEach(node => {
+        scan(node);
+        scanAncestors(node);
+      });
     }
   }
 
@@ -332,7 +301,4 @@
   });
 
   scan(document.documentElement);
-  // Heuristics are suppressed on still-open nodes while parsing.
-  document.addEventListener('DOMContentLoaded', () =>
-    scan(document.documentElement));
 })();
