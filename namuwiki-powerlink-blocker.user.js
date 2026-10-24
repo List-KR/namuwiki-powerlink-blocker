@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NamuWiki PowerLink Blocker
 // @namespace    List-KR
-// @version      2.9.6
+// @version      2.9.8
 // @description  Block NamuWiki PowerLink
 // @match        https://namu.wiki/*
 // @updateURL    https://raw.githubusercontent.com/List-KR/namuwiki-powerlink-blocker/refs/heads/main/namuwiki-powerlink-blocker.user.js
@@ -102,14 +102,27 @@
   }
 
   function isPowerLink(el) {
-    // Current slots omit width:auto and wrap their table in a div.
-    return el.querySelector(
+    if (el.querySelector(
       ':scope > div > table a[href^="#"] img[data-doc][data-filesize]'
     ) && [...el.children].some(header =>
       header.querySelector(':scope > div > span')?.textContent.trim() === '파워링크' &&
       [...header.querySelectorAll(':scope > span > a[href^="#"]')].some(link =>
         link.textContent.trim() === '광고등록')
-    );
+    ))
+      return true;
+
+    // Image labels are shared by both table and div-based ads.
+    return el.style.color.startsWith('rgba(') &&
+      [...el.children].some(header =>
+        header.querySelector(':scope > span > span > img[data-doc][data-filesize]') &&
+        header.querySelector(':scope > span > a[href^="#"] img[data-doc][data-filesize]')
+      ) && (
+        el.querySelectorAll(':scope > div > table a[href^="#"]').length >= 3 ||
+        [...el.querySelectorAll(':scope > div > div > div')].some(card =>
+          card.querySelector(':scope > div > span > strong > a[title]') &&
+          card.querySelectorAll(':scope > div > span > a[title]').length >= 2
+        )
+      );
   }
 
   function isAdMarker(el) {
