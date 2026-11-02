@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NamuWiki PowerLink Blocker
 // @namespace    List-KR
-// @version      2.9.8
+// @version      2.9.9
 // @description  Block NamuWiki PowerLink
 // @match        https://namu.wiki/*
 // @updateURL    https://raw.githubusercontent.com/List-KR/namuwiki-powerlink-blocker/refs/heads/main/namuwiki-powerlink-blocker.user.js
@@ -111,18 +111,32 @@
     ))
       return true;
 
+    if (!el.style.color.startsWith('rgba('))
+      return false;
+
     // Image labels are shared by both table and div-based ads.
-    return el.style.color.startsWith('rgba(') &&
-      [...el.children].some(header =>
-        header.querySelector(':scope > span > span > img[data-doc][data-filesize]') &&
-        header.querySelector(':scope > span > a[href^="#"] img[data-doc][data-filesize]')
-      ) && (
-        el.querySelectorAll(':scope > div > table a[href^="#"]').length >= 3 ||
-        [...el.querySelectorAll(':scope > div > div > div')].some(card =>
-          card.querySelector(':scope > div > span > strong > a[title]') &&
-          card.querySelectorAll(':scope > div > span > a[title]').length >= 2
-        )
-      );
+    if ([...el.children].some(header =>
+      header.querySelector(':scope > span > span > img[data-doc][data-filesize]') &&
+      header.querySelector(':scope > span > a[href^="#"] img[data-doc][data-filesize]')
+    ) && (
+      el.querySelectorAll(':scope > div > table a[href^="#"]').length >= 3 ||
+      [...el.querySelectorAll(':scope > div > div > div')].some(card =>
+        card.querySelector(':scope > div > span > strong > a[title]') &&
+        card.querySelectorAll(':scope > div > span > a[title]').length >= 2
+      )
+    ))
+      return true;
+
+    // CSS-drawn labels leave the header's ad-registration link without text
+    // or image. Each card pairs a hash-linked thumbnail with hash-linked
+    // title, URL and description text.
+    return [...el.children].some(header =>
+      [...header.querySelectorAll(':scope > span > a[href^="#"]')].some(link =>
+        !link.textContent.trim() && !link.querySelector('img'))
+    ) && [...el.querySelectorAll('a[href^="#"] img[data-doc][data-filesize]')]
+      .some(img => [...img.closest('a').parentElement
+        .querySelectorAll('a[href^="#"]')]
+        .filter(link => link.textContent.trim()).length >= 2);
   }
 
   function isAdMarker(el) {
