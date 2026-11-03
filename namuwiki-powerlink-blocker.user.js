@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NamuWiki PowerLink Blocker
 // @namespace    List-KR
-// @version      2.9.9
+// @version      3.0.0
 // @description  Block NamuWiki PowerLink
 // @match        https://namu.wiki/*
 // @updateURL    https://raw.githubusercontent.com/List-KR/namuwiki-powerlink-blocker/refs/heads/main/namuwiki-powerlink-blocker.user.js
@@ -13,319 +13,321 @@
 (() => {
   'use strict';
 
-  const protectedContent =
+  // Detection relies on what an ad has to be, not on how the frontend draws
+  // it. Class names, inline styles, labels and nesting have all changed
+  // between releases; these properties have not:
+  //
+  // 1. PowerLink must show each advertiser's display URL, but its links
+  //    pose as section anchors (href="#s-N") so the real target stays out
+  //    of the DOM. A wiki link that shows a domain navigates to it.
+  // 2. Ad networks name their own containers; the wiki cannot rename them.
+  // 3. An unfilled slot reserves its height with min-height.
+
+  // Wiki-authored structure that never sits inside an ad. Tables and images
+  // are left out on purpose: PowerLink imitates both.
+  const wikiContent =
     'article,main,header,footer,nav,aside,h1,h2,h3,h4,h5,h6,' +
-    'p,blockquote,ul,ol,pre,table,time,' +
-    'form,input,textarea,select,' +
-    'figure,picture,video,audio,canvas,iframe,object,embed,' +
-    'img[data-doc],img[data-filesize],[id]';
+    'p,blockquote,ul,ol,dl,pre,time,form,input,textarea,select,button,' +
+    'video,audio,canvas';
 
-  const isDiv = el =>
-    el?.nodeType === 1 && el.localName === 'div';
+  const media = 'img,picture,svg,video,audio,canvas,iframe,object,embed';
 
-  const hasProtectedContent = el =>
-    el.matches(protectedContent) ||
-    el.querySelector(protectedContent);
+  const networkAd =
+    '[id^="google_ads_iframe_"],ins.adsbygoogle,' +
+    '.vm-placement,.vm-dynamic-placement';
 
-  const knownAdShells = new WeakSet();
+  // Cards also fake links with non-anchor elements that carry an href.
+  const linkSelector = 'a,[href]';
+
+  const seedSelector = linkSelector + ',div,' + networkAd;
+
+  const displayUrl =
+    /^(?:https?:\/\/)?((?:[\p{L}\p{N}-]+\.)+\p{L}{2,})(?::\d+)?(?:[/?#]\S*)?$/u;
+
+  // Ad slots reserve 90-300px; page layout containers reserve far more.
+  const slotMinHeight = 30;
+  const slotMaxHeight = 400;
+
   const hiddenShells = new Map();
 
-  const getScopes = el => [...el.attributes]
-    .map(attr => attr.name)
-    .filter(name => /^data-v-[0-9a-f]+$/i.test(name));
-
-  const hasDirectText = el => [...el.childNodes].some(node =>
-    node.nodeType === 3 && node.textContent.trim());
-
-  function isEmptyShell(el) {
-    return !el.textContent.trim() &&
-      !el.querySelector(':not(div)');
-  }
-
-  function isKnownEmptyAdShell(el) {
-    return knownAdShells.has(el) && isEmptyShell(el);
-  }
-
-  function isEmptySectionSlot(el) {
-    // An unmounted component can leave only a Vue comment between article
-    // sections. Infer that boundary from scope relationships, never hashes.
-    if (el.id || el.hasAttribute('role') || el.hasAttribute('aria-label') ||
-      el.hasAttribute('aria-labelledby') || el.childElementCount ||
-      el.textContent.trim() ||
-      ![...el.childNodes].some(node => node.nodeType === 8))
-      return false;
-
-    const parent = el.parentElement;
-    const before = el.previousElementSibling;
-    const after = el.nextElementSibling;
-    if (!isDiv(parent) || !isDiv(before) || !isDiv(after) ||
-      !before.textContent.trim() || !before.querySelector('a[href],p') ||
-      !after.querySelector('h2,h3,h4,h5,h6'))
-      return false;
-
-    const scopes = getScopes(el);
-    const articleScopes = getScopes(before).filter(scope =>
-      after.hasAttribute(scope));
-    if (!scopes.length || !articleScopes.length ||
-      scopes.some(scope => parent.hasAttribute(scope) ||
-        before.hasAttribute(scope) || after.hasAttribute(scope)))
-      return false;
-
-    // Pseudo-elements may contain actual labels or icons despite an empty DOM.
-    return ['::before', '::after'].every(pseudo => {
-      const content = getComputedStyle(el, pseudo).content;
-      return content === 'none' || content === 'normal' ||
-        content === '""' || content === "''";
-    });
-  }
-
-  const isExplicitAdMount = el =>
-    el.id.startsWith('_gad_') ||
-    el.classList.contains('vm-dynamic-placement');
-
-  function isDynamicAdMount(el) {
-    const parent = el.parentElement;
-    const shell = parent?.parentElement;
-
-    return (
-      /_\d+$/.test(el.id) &&
-      !el.childElementCount &&
-      !el.textContent.trim() &&
-      isDiv(parent) &&
-      parent.childElementCount === 1 &&
-      isDiv(shell) &&
-      shell.childElementCount === 1 &&
-      [...el.attributes].some(attr =>
-        /^data-v-[0-9a-f]+$/i.test(attr.name) &&
-        parent.hasAttribute(attr.name))
-    );
-  }
-
-  function isPowerLink(el) {
-    if (el.querySelector(
-      ':scope > div > table a[href^="#"] img[data-doc][data-filesize]'
-    ) && [...el.children].some(header =>
-      header.querySelector(':scope > div > span')?.textContent.trim() === '파워링크' &&
-      [...header.querySelectorAll(':scope > span > a[href^="#"]')].some(link =>
-        link.textContent.trim() === '광고등록')
-    ))
+  // While parsing, an element with no following sibling anywhere up its
+  // chain may still receive children; judging it now could swallow content
+  // that has not arrived yet.
+  function isSettled(el) {
+    if (document.readyState !== 'loading')
       return true;
 
-    if (!el.style.color.startsWith('rgba('))
+    for (let node = el; node; node = node.parentNode) {
+      if (node.nextSibling)
+        return true;
+    }
+
+    return false;
+  }
+
+  // A link that stays on this document: no href, a fragment, javascript:,
+  // or the current URL itself.
+  function isInertLink(el) {
+    if (el.localName !== 'a' && !el.hasAttribute('href'))
       return false;
 
-    // Image labels are shared by both table and div-based ads.
-    if ([...el.children].some(header =>
-      header.querySelector(':scope > span > span > img[data-doc][data-filesize]') &&
-      header.querySelector(':scope > span > a[href^="#"] img[data-doc][data-filesize]')
-    ) && (
-      el.querySelectorAll(':scope > div > table a[href^="#"]').length >= 3 ||
-      [...el.querySelectorAll(':scope > div > div > div')].some(card =>
-        card.querySelector(':scope > div > span > strong > a[title]') &&
-        card.querySelectorAll(':scope > div > span > a[title]').length >= 2
-      )
-    ))
+    const href = el.getAttribute('href')?.trim();
+    if (!href || href.startsWith('#') || /^javascript:/i.test(href))
       return true;
 
-    // CSS-drawn labels leave the header's ad-registration link without text
-    // or image. Each card pairs a hash-linked thumbnail with hash-linked
-    // title, URL and description text.
-    return [...el.children].some(header =>
-      [...header.querySelectorAll(':scope > span > a[href^="#"]')].some(link =>
-        !link.textContent.trim() && !link.querySelector('img'))
-    ) && [...el.querySelectorAll('a[href^="#"] img[data-doc][data-filesize]')]
-      .some(img => [...img.closest('a').parentElement
-        .querySelectorAll('a[href^="#"]')]
-        .filter(link => link.textContent.trim()).length >= 2);
-  }
-
-  function isAdMarker(el) {
-    if (!isDiv(el))
+    let url;
+    try {
+      url = new URL(href, location.href);
+    } catch {
       return false;
-
-    if (isExplicitAdMount(el) || isPowerLink(el) ||
-      isKnownEmptyAdShell(el) ||
-      isEmptySectionSlot(el) ||
-      (el.style.color.startsWith('rgba(') && !hasProtectedContent(el)) ||
-      isDynamicAdMount(el))
-      return true;
-
-    if (el.style.width !== 'auto')
-      return false;
-
-    // In-article PowerLink slots are mounted empty and filled lazily; the
-    // reserved min-height of their wrapper shows as a blank gap meanwhile.
-    return isEmptyShell(el) || [...el.children].some(child =>
-      child.localName === 'table' &&
-      child.querySelector(
-        'a[href^="#"] img[data-doc][data-filesize]'
-      )
-    );
-  }
-
-  // Wrappers whose only child is the ad still carry margins/min-height.
-  function climbSingleChildWrappers(shell) {
-    for (let i = 0; i < 8; i++) {
-      const parent = shell.parentElement;
-
-      if (!isDiv(parent) || parent.id ||
-        parent.matches(protectedContent) || parent.hasAttribute('role') ||
-        parent.childElementCount !== 1 || hasDirectText(parent))
-        break;
-
-      shell = parent;
     }
 
-    return shell;
+    return url.origin === location.origin &&
+      url.pathname === location.pathname &&
+      url.search === location.search;
   }
 
-  function findShell(root) {
-    // Explicit markers must win over the generic /_\d+$/ heuristic.
-    // _gad_inarticle_2 matches both, which previously left its outer shell.
-    if (isExplicitAdMount(root) || isDynamicAdMount(root)) {
-      const shell = climbSingleChildWrappers(root);
-      knownAdShells.add(shell);
-      return shell;
-    }
-
-    if (isKnownEmptyAdShell(root) || isEmptySectionSlot(root))
-      return root;
-
-    const scopes = getScopes(root);
-    let shell = root;
-
-    for (let i = 0; scopes.length && i < 8; i++) {
-      const parent = shell.parentElement;
-
-      if (!isDiv(parent) || parent.id ||
-        parent.matches(protectedContent) || parent.hasAttribute('role') ||
-        hasDirectText(parent) ||
-        !scopes.some(scope => parent.hasAttribute(scope)) ||
-        [...parent.children].some(child =>
-          child !== shell &&
-          (hasProtectedContent(child) || child.textContent.trim())))
-        break;
-
-      shell = parent;
-    }
-
-    // The scoped component sits inside unscoped layout wrappers
-    // (e.g. mobile in-article slot: margin 16px + min-height 250px).
-    shell = climbSingleChildWrappers(shell);
-    knownAdShells.add(shell);
-    return shell;
+  // The wiki's own host is never an advertiser.
+  function getDisplayHost(text) {
+    const host = displayUrl.exec(text)?.[1].toLowerCase();
+    return host && host !== location.hostname &&
+      !host.endsWith('.' + location.hostname) ? host : null;
   }
 
-  function hide(el, marker) {
-    if (!el)
-      return;
+  const isAdLink = el =>
+    isInertLink(el) && !!getDisplayHost(el.textContent.trim());
 
-    if (!hiddenShells.has(el)) {
-      hiddenShells.set(el, {
-        value: el.style.getPropertyValue('display'),
-        priority: el.style.getPropertyPriority('display'),
-        markers: new Set()
-      });
-    }
+  // Wiki prose carries text outside inert links; ad cards carry none.
+  function hasForeignText(root) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
 
-    hiddenShells.get(el).markers.add(marker);
-
-    if (el.style.getPropertyValue('display') === 'none' &&
-      el.style.getPropertyPriority('display') === 'important')
-      return;
-
-    el.style.setProperty('display', 'none', 'important');
-  }
-
-  function recheckHiddenShells() {
-    for (const [shell, state] of hiddenShells) {
-      // A document-start scan can see a partially parsed layout. Restore
-      // it if later content makes it no longer an ad-only wrapper.
-      const stillAdOnly = shell.isConnected &&
-        ((knownAdShells.has(shell) && isEmptyShell(shell)) ||
-        [...state.markers].some(marker =>
-          shell.contains(marker) && isAdMarker(marker) &&
-          findShell(marker) === shell));
-
-      if (stillAdOnly)
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      if (!node.data.trim())
         continue;
 
-      if (shell.style.getPropertyValue('display') === 'none' &&
-        shell.style.getPropertyPriority('display') === 'important') {
+      const link = node.parentElement.closest(linkSelector);
+      if (!link || !isInertLink(link))
+        return true;
+    }
+
+    return false;
+  }
+
+  function hasNavigatingLink(root) {
+    for (const link of root.querySelectorAll(linkSelector)) {
+      if (!isInertLink(link))
+        return true;
+    }
+
+    return false;
+  }
+
+  // The largest ancestor that is still nothing but inert links.
+  function findAdRoot(link) {
+    let root = link;
+
+    for (let parent = link.parentElement;
+      parent && parent !== document.body && isSettled(parent);
+      parent = parent.parentElement) {
+      if (parent.matches(wikiContent) || parent.querySelector(wikiContent) ||
+        hasForeignText(parent) || hasNavigatingLink(parent))
+        break;
+
+      root = parent;
+    }
+
+    return root;
+  }
+
+  // A lone link is a honeypot; a card pairs its display URL with title and
+  // description links.
+  function isAdRoot(root) {
+    let textLinks = 0;
+    let urlLinks = 0;
+
+    for (const link of root.querySelectorAll(linkSelector)) {
+      if (!isInertLink(link))
+        continue;
+
+      const text = link.textContent.trim();
+      if (text)
+        textLinks++;
+      if (getDisplayHost(text))
+        urlLinks++;
+    }
+
+    return urlLinks > 0 && textLinks >= 2;
+  }
+
+  // GPT nests its iframe container inside the publisher's slot element.
+  function findNetworkRoot(el) {
+    let gpt = null;
+
+    for (let node = el; node; node = node.parentElement) {
+      if (node.id.startsWith('google_ads_iframe_'))
+        gpt = node;
+    }
+
+    return gpt ? gpt.parentElement : el;
+  }
+
+  function isReservedSlot(el) {
+    if (el.localName !== 'div' || el.querySelector(':not(div)') ||
+      el.textContent.trim() || !isSettled(el))
+      return false;
+
+    const style = getComputedStyle(el);
+    const minHeight = parseFloat(style.minHeight);
+
+    // Backgrounds and pseudo-elements can draw content into an empty box.
+    return style.minHeight.endsWith('px') &&
+      minHeight >= slotMinHeight && minHeight <= slotMaxHeight &&
+      style.backgroundImage === 'none' &&
+      ['::before', '::after'].every(pseudo =>
+        ['none', 'normal', '""', "''"].includes(
+          getComputedStyle(el, pseudo).content));
+  }
+
+  const isBlank = el =>
+    !el.matches(media) && !el.matches(wikiContent) &&
+    !el.querySelector(media) && !el.querySelector(wikiContent) &&
+    !el.textContent.trim();
+
+  // Wrappers around an ad keep its margins and min-height. Climb while
+  // everything beside it is blank, decoy siblings included.
+  function findShell(root) {
+    let shell = root;
+
+    for (let parent = root.parentElement;
+      parent && parent !== document.body && isSettled(parent);
+      parent = parent.parentElement) {
+      if (parent.matches(wikiContent) ||
+        [...parent.childNodes].some(node => node !== shell &&
+          (node.nodeType === Node.TEXT_NODE ? node.data.trim() :
+            node.nodeType === Node.ELEMENT_NODE && !isBlank(node))))
+        break;
+
+      shell = parent;
+    }
+
+    return shell;
+  }
+
+  function shellFor(el) {
+    if (!el.isConnected)
+      return null;
+
+    if (el.matches(networkAd))
+      return findShell(findNetworkRoot(el));
+
+    if (isAdLink(el)) {
+      const root = findAdRoot(el);
+      return isAdRoot(root) ? findShell(root) : null;
+    }
+
+    return isReservedSlot(el) ? findShell(el) : null;
+  }
+
+  const isHiddenByUs = el =>
+    el.style.getPropertyValue('display') === 'none' &&
+    el.style.getPropertyPriority('display') === 'important';
+
+  function hide(shell, marker) {
+    let state = hiddenShells.get(shell);
+
+    if (!state) {
+      state = {
+        value: shell.style.getPropertyValue('display'),
+        priority: shell.style.getPropertyPriority('display'),
+        markers: new Set()
+      };
+      hiddenShells.set(shell, state);
+    }
+
+    state.markers.add(marker);
+
+    if (!isHiddenByUs(shell))
+      shell.style.setProperty('display', 'none', 'important');
+  }
+
+  // A partial parse or a reused component can make an earlier verdict
+  // stale: restore every shell that none of its markers resolves to.
+  function recheck() {
+    for (const [shell, state] of hiddenShells) {
+      for (const marker of state.markers) {
+        if (shellFor(marker) !== shell)
+          state.markers.delete(marker);
+      }
+
+      if (state.markers.size)
+        continue;
+
+      if (isHiddenByUs(shell)) {
         if (state.value)
           shell.style.setProperty('display', state.value, state.priority);
         else
           shell.style.removeProperty('display');
       }
 
-      knownAdShells.delete(shell);
       hiddenShells.delete(shell);
     }
   }
 
-  function scan(root) {
-    if (!root?.querySelectorAll)
+  function check(el, seen) {
+    if (seen.has(el))
       return;
 
-    if (isAdMarker(root))
-      hide(findShell(root), root);
+    seen.add(el);
 
-    root.querySelectorAll('div').forEach(el => {
-      if (isAdMarker(el))
-        hide(findShell(el), el);
-    });
+    const shell = shellFor(el);
+    if (shell)
+      hide(shell, el);
   }
 
-  function scanAncestors(node) {
-    let el = node?.parentElement;
+  function scan(root, seen) {
+    if (root.nodeType !== Node.ELEMENT_NODE)
+      return;
 
-    for (let i = 0; el && i < 10; i++, el = el.parentElement) {
-      if (!isAdMarker(el))
-        continue;
+    check(root, seen);
+    root.querySelectorAll(seedSelector).forEach(el => check(el, seen));
+  }
 
-      hide(findShell(el), el);
-      break;
-    }
+  // Text, attribute and removal changes can turn an ancestor into a seed:
+  // a link gains its display URL, a slot loses its last child.
+  function scanAncestors(node, seen) {
+    let el = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+
+    for (let i = 0; el && i < 8; i++, el = el.parentElement)
+      check(el, seen);
   }
 
   function onMutations(records) {
-    recheckHiddenShells();
+    recheck();
+
+    const seen = new Set();
 
     for (const record of records) {
-      if (record.type === 'attributes') {
-        scan(record.target);
-        scanAncestors(record.target);
-        continue;
-      }
-
-      // childList fires for removals too: the target can now be an empty
-      // ad shell even though addedNodes is empty.
-      scan(record.target);
-      scanAncestors(record.target);
-
-      record.addedNodes.forEach(node => {
-        scan(node);
-        scanAncestors(node);
-      });
+      scanAncestors(record.target, seen);
+      record.addedNodes.forEach(node => scan(node, seen));
     }
   }
 
-  const observer = new MutationObserver(onMutations);
+  function rescan() {
+    recheck();
 
-  observer.observe(document, {
+    const seen = new Set();
+    document.querySelectorAll(seedSelector).forEach(el => check(el, seen));
+  }
+
+  new MutationObserver(onMutations).observe(document, {
     childList: true,
     subtree: true,
     characterData: true,
     attributes: true,
-    attributeFilter: [
-      'id',
-      'class',
-      'style',
-      'href',
-      'data-doc',
-      'data-filesize'
-    ]
+    attributeFilter: ['id', 'class', 'style', 'href']
   });
 
-  scan(document.documentElement);
+  rescan();
+  // Verdicts deferred on still-open nodes are settled once parsing ends.
+  document.addEventListener('DOMContentLoaded', rescan);
 })();
