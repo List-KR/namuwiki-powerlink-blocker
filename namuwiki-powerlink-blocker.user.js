@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NamuWiki PowerLink Blocker
 // @namespace    List-KR
-// @version      3.0.0
+// @version      3.0.1
 // @description  Block NamuWiki PowerLink
 // @match        https://namu.wiki/*
 // @updateURL    https://raw.githubusercontent.com/List-KR/namuwiki-powerlink-blocker/refs/heads/main/namuwiki-powerlink-blocker.user.js
@@ -20,6 +20,8 @@
   // 1. PowerLink must show each advertiser's display URL, but its links
   //    pose as section anchors (href="#s-N") so the real target stays out
   //    of the DOM. A wiki link that shows a domain navigates to it.
+  //    When the labels are drawn by CSS or images instead, the links keep
+  //    no text and lead nowhere: no href, or a fragment naming nothing.
   // 2. Ad networks name their own containers; the wiki cannot rename them.
   // 3. An unfilled slot reserves its height with min-height.
 
@@ -32,8 +34,10 @@
 
   const media = 'img,picture,svg,video,audio,canvas,iframe,object,embed';
 
+  // _gad_ mounts are empty until GPT fills them, but already sit in a
+  // visible ad box.
   const networkAd =
-    '[id^="google_ads_iframe_"],ins.adsbygoogle,' +
+    '[id^="_gad_"],[id^="google_ads_iframe_"],ins.adsbygoogle,' +
     '.vm-placement,.vm-dynamic-placement';
 
   // Cards also fake links with non-anchor elements that carry an href.
@@ -97,12 +101,57 @@
   const isAdLink = el =>
     isInertLink(el) && !!getDisplayHost(el.textContent.trim());
 
+  // An element with an id is an anchor target, not a link. A fragment can
+  // only be judged missing once parsing has ended.
+  function isDeadLink(el) {
+    if (el.id || !isInertLink(el))
+      return false;
+
+    const href = el.getAttribute('href')?.trim();
+    if (!href || /^javascript:/i.test(href))
+      return true;
+
+    if (!href.startsWith('#') || document.readyState === 'loading')
+      return false;
+
+    let name;
+    try {
+      name = decodeURIComponent(href.slice(1));
+    } catch {
+      name = href.slice(1);
+    }
+
+    return !!name && name.toLowerCase() !== 'top' &&
+      !document.getElementById(name) &&
+      !document.getElementsByName(name).length;
+  }
+
+  const isBareDeadLink = el => isDeadLink(el) && !el.textContent.trim();
+
+  // Ads carry decoy text that their stylesheet hides.
+  const isRenderedText = node =>
+    !!node.data.trim() && node.parentElement.checkVisibility({
+      opacityProperty: true,
+      visibilityProperty: true
+    });
+
+  function hasRenderedText(root) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      if (isRenderedText(node))
+        return true;
+    }
+
+    return false;
+  }
+
   // Wiki prose carries text outside inert links; ad cards carry none.
   function hasForeignText(root) {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
 
     for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-      if (!node.data.trim())
+      if (!isRenderedText(node))
         continue;
 
       const link = node.parentElement.closest(linkSelector);
@@ -140,10 +189,11 @@
   }
 
   // A lone link is a honeypot; a card pairs its display URL with title and
-  // description links.
+  // description links, drawn as text or not.
   function isAdRoot(root) {
     let textLinks = 0;
     let urlLinks = 0;
+    let bareLinks = 0;
 
     for (const link of root.querySelectorAll(linkSelector)) {
       if (!isInertLink(link))
@@ -154,9 +204,11 @@
         textLinks++;
       if (getDisplayHost(text))
         urlLinks++;
+      if (isBareDeadLink(link))
+        bareLinks++;
     }
 
-    return urlLinks > 0 && textLinks >= 2;
+    return (urlLinks > 0 && textLinks >= 2) || bareLinks >= 3;
   }
 
   // GPT nests its iframe container inside the publisher's slot element.
@@ -191,7 +243,7 @@
   const isBlank = el =>
     !el.matches(media) && !el.matches(wikiContent) &&
     !el.querySelector(media) && !el.querySelector(wikiContent) &&
-    !el.textContent.trim();
+    !hasRenderedText(el);
 
   // Wrappers around an ad keep its margins and min-height. Climb while
   // everything beside it is blank, decoy siblings included.
@@ -220,7 +272,7 @@
     if (el.matches(networkAd))
       return findShell(findNetworkRoot(el));
 
-    if (isAdLink(el)) {
+    if (isAdLink(el) || isBareDeadLink(el)) {
       const root = findAdRoot(el);
       return isAdRoot(root) ? findShell(root) : null;
     }
