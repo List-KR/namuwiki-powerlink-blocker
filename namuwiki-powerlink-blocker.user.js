@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NamuWiki PowerLink Blocker
 // @namespace    List-KR
-// @version      3.0.1
+// @version      3.0.2
 // @description  Block NamuWiki PowerLink
 // @match        https://namu.wiki/*
 // @updateURL    https://raw.githubusercontent.com/List-KR/namuwiki-powerlink-blocker/refs/heads/main/namuwiki-powerlink-blocker.user.js
@@ -98,8 +98,15 @@
       !host.endsWith('.' + location.hostname) ? host : null;
   }
 
-  const isAdLink = el =>
-    isInertLink(el) && !!getDisplayHost(el.textContent.trim());
+  function hasDisplayHost(link) {
+    if (getDisplayHost(link.textContent.trim()))
+      return true;
+
+    return [...link.querySelectorAll(':scope > table span')].some(span =>
+      !span.childElementCount && getDisplayHost(span.textContent.trim()));
+  }
+
+  const isAdLink = el => isInertLink(el) && hasDisplayHost(el);
 
   // An element with an id is an anchor target, not a link. A fragment can
   // only be judged missing once parsing has ended.
@@ -202,7 +209,7 @@
       const text = link.textContent.trim();
       if (text)
         textLinks++;
-      if (getDisplayHost(text))
+      if (hasDisplayHost(link))
         urlLinks++;
       if (isBareDeadLink(link))
         bareLinks++;
